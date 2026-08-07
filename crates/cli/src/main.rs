@@ -328,7 +328,21 @@ async fn run(
         Store::open(&Store::default_path())?,
         &session.id,
     );
-    let mut agent = Agent::new(provider, Registry::standard(), tool_ctx, config)
+    // The pen: the model can delegate bounded tasks to durable child agents
+    // (sessions in the same store, resumable and listed like any other).
+    let mut registry = Registry::standard();
+    registry.register(std::sync::Arc::new(bullpen_harness::PenTool::new(
+        provider.clone(),
+        &session.id,
+        bullpen_harness::PenConfig::new(
+            Store::default_path(),
+            cwd.clone(),
+            provider_kind.name(),
+            config.model.clone(),
+            system_prompt(&cwd),
+        ),
+    )));
+    let mut agent = Agent::new(provider, registry, tool_ctx, config)
         .with_transcript(transcript, usage)
         .with_events(tx)
         .with_journal(Box::new(journal));
@@ -364,14 +378,19 @@ fn sessions() -> anyhow::Result<()> {
         return Ok(());
     }
     for s in sessions {
+        let child_marker = match &s.parent_session_id {
+            Some(parent) => format!(" └ child of {}", &parent[..8]),
+            None => String::new(),
+        };
         println!(
-            "{}  {}  {:<10}  {:>6}/{:<6}  {}",
+            "{}  {}  {:<10}  {:>6}/{:<6}  {}{}",
             &s.id[..8],
             s.updated_at,
             s.provider,
             s.usage.input_tokens,
             s.usage.output_tokens,
             if s.title.is_empty() { "(untitled)" } else { &s.title },
+            child_marker,
         );
     }
     Ok(())

@@ -51,7 +51,10 @@ pub trait Tool: Send + Sync {
     fn replay_safe(&self) -> bool {
         false
     }
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError>;
+    /// `call_id` is the provider-assigned tool_use id for this invocation —
+    /// stable across a replay, which is what lets effectful tools (like the
+    /// pen) derive deterministic identities.
+    async fn run(&self, ctx: &ToolCtx, call_id: &str, input: Value) -> Result<String, ToolError>;
 }
 
 #[derive(Default, Clone)]

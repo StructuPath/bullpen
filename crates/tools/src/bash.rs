@@ -42,7 +42,7 @@ impl Tool for Bash {
         }
     }
 
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let command = required_str(&input, "command")?;
         let timeout = input
             .get("timeout_seconds")
@@ -105,14 +105,14 @@ mod tests {
 
     #[tokio::test]
     async fn runs_and_captures_stdout() {
-        let out = Bash.run(&ctx(), json!({"command": "echo hello"})).await.unwrap();
+        let out = Bash.run(&ctx(), "t", json!({"command": "echo hello"})).await.unwrap();
         assert_eq!(out.trim(), "hello");
     }
 
     #[tokio::test]
     async fn nonzero_exit_is_error_with_output() {
         let err = Bash
-            .run(&ctx(), json!({"command": "echo oops >&2; exit 3"}))
+            .run(&ctx(), "t", json!({"command": "echo oops >&2; exit 3"}))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -123,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn times_out() {
         let err = Bash
-            .run(&ctx(), json!({"command": "sleep 5", "timeout_seconds": 1}))
+            .run(&ctx(), "t", json!({"command": "sleep 5", "timeout_seconds": 1}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(1)));
@@ -131,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_command_rejected() {
-        let err = Bash.run(&ctx(), json!({})).await.unwrap_err();
+        let err = Bash.run(&ctx(), "t", json!({})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
 }

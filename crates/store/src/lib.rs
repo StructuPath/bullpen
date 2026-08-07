@@ -53,6 +53,8 @@ pub struct Session {
     pub usage: Usage,
     pub created_at: String,
     pub updated_at: String,
+    /// Set for pen children; the parent session's id.
+    pub parent_session_id: Option<String>,
 }
 
 /// One conversation entry. `payload` holds a [`Message`] for kind
@@ -186,6 +188,14 @@ impl Store {
             tx.execute_batch("DROP TABLE messages; PRAGMA user_version = 3;")?;
             tx.commit()?;
         }
+        if version < 4 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
+                 PRAGMA user_version = 4;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -209,11 +219,67 @@ impl Store {
         self.get_session(&id)
     }
 
+    /// Create a pen child with a caller-provided (deterministic) id.
+    /// Idempotent: if the id already exists, the existing session is
+    /// returned — this is how a replayed spawn reattaches to its child.
+    pub fn create_child_session(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+        cwd: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<Session, StoreError> {
+        if let Ok(existing) = self.get_session(child_id) {
+            return Ok(existing);
+        }
+        self.conn.execute(
+            "INSERT INTO sessions (id, cwd, provider, model, parent_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![child_id, cwd, provider, model, parent_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO lanes (session_id, name) VALUES (?1, ?2)",
+            params![child_id, MAIN_LANE],
+        )?;
+        self.get_session(child_id)
+    }
+
+    /// How many children a session has spawned — the durable count budget.
+    pub fn count_children(&self, parent_id: &str) -> Result<u64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1",
+            params![parent_id],
+            |r| r.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Outcome of the most recent finished operation, if any.
+    pub fn last_run_outcome(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT payload FROM records
+                 WHERE session_id = ?1 AND kind = 'operation_finished'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|p| {
+                serde_json::from_str::<Value>(&p)
+                    .ok()?
+                    .get("outcome")?
+                    .as_str()
+                    .map(str::to_string)
+            }))
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Session, StoreError> {
         self.conn
             .query_row(
                 "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                        created_at, updated_at
+                        created_at, updated_at, parent_session_id
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -227,7 +293,7 @@ impl Store {
     pub fn resolve_session(&self, prefix: &str) -> Result<Session, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                    created_at, updated_at
+                    created_at, updated_at, parent_session_id
              FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut matches: Vec<Session> = stmt
@@ -243,7 +309,7 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                    created_at, updated_at
+                    created_at, updated_at, parent_session_id
              FROM sessions ORDER BY updated_at DESC",
         )?;
         Ok(stmt
@@ -570,6 +636,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         },
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        parent_session_id: row.get(9)?,
     })
 }
 

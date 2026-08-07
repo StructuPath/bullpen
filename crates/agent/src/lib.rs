@@ -254,8 +254,9 @@ impl Agent {
                     name: intent.name.clone(),
                     input: intent.input.clone(),
                 });
-                let (output, is_error) =
-                    self.run_tool(&intent.name, intent.input.clone()).await;
+                let (output, is_error) = self
+                    .run_tool(&intent.name, &intent.tool_use_id, intent.input.clone())
+                    .await;
                 self.emit(Event::ToolEnd {
                     id: intent.tool_use_id.clone(),
                     name: intent.name.clone(),
@@ -278,11 +279,11 @@ impl Agent {
         Err(AgentError::MaxTurns(self.config.max_turns))
     }
 
-    async fn run_tool(&self, name: &str, input: serde_json::Value) -> (String, bool) {
+    async fn run_tool(&self, name: &str, call_id: &str, input: serde_json::Value) -> (String, bool) {
         let Some(tool) = self.registry.get(name) else {
             return (format!("unknown tool: {name}"), true);
         };
-        match tool.run(&self.tool_ctx, input).await {
+        match tool.run(&self.tool_ctx, call_id, input).await {
             Ok(output) => (output, false),
             Err(e) => (e.to_string(), true),
         }
@@ -356,6 +357,7 @@ mod tests {
         async fn run(
             &self,
             _ctx: &ToolCtx,
+            _call_id: &str,
             input: serde_json::Value,
         ) -> Result<String, bullpen_tools::ToolError> {
             Ok(format!("echo: {}", input["value"]))

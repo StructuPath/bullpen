@@ -194,12 +194,18 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   adapter; cache-control breakpoints on the system block. Event stream grows
   text deltas. (The Codex adapter already consumes SSE but buffers it;
   incremental deltas land here too.)
-- **M2 — The pen (durable subagents).** Foundation (store v3: entry tree,
-  records, reduction, recovery — see "Persistence and durable execution")
-  landed 2026-08-07. Next: supervisor with budgets (count, wall-clock,
-  tokens), children as forked sessions with deterministic ids, resumable
-  and attachable across process exits, `agent` tool for the coordinator,
-  parallel scheduling of read-only children.
+- **M2 — The pen (durable subagents).** SHIPPED 2026-08-07 (foundation +
+  pen same day). The `agent` tool spawns children as sessions in the same
+  store: deterministic ids (`uuidv5(parent, tool_call_id)`) make replayed
+  spawns *reattach* — a completed child returns its recorded answer with no
+  provider call, an interrupted child is recovered and continued. Modes:
+  `inspect` (read-only tools) and `work` (full registry); never a nested
+  pen. Budgets are durable: child count is a database count (default 20), a
+  crash-restart loop cannot reset it; 15-minute wall clock per child run.
+  Children appear in `bullpen sessions` (`└ child of …`) and resume with
+  `run -r` like any session. Still open for M2.x: parallel scheduling of
+  inspect children, live child event streaming to the parent's UI, token
+  budgets (needs the usage ledger).
 - **M3 — Sandbox + permissions.** `sandbox` crate: capability grants (fs
   read/write path sets, network, process spawn) resolved per tool call;
   Seatbelt profile generation on macOS, Landlock on Linux. Approvals become

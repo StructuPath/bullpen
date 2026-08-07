@@ -8,6 +8,12 @@
 //!
 //! This crate is the future home of the pen (durable subagents).
 
+pub mod pen;
+#[cfg(test)]
+pub(crate) mod testutil;
+
+pub use pen::{PenConfig, PenTool};
+
 use bullpen_agent::{Journal, JournalError, RunOutcome, ToolIntent};
 use bullpen_llm::{Message, Usage};
 use bullpen_store::{Recovery, Store, StoreError, recover, title_from};
@@ -26,7 +32,7 @@ pub fn prepare_session(
 
 /// SQLite-backed [`Journal`]. Owns the store for the duration of a run.
 pub struct StoreJournal {
-    store: Store,
+    store: std::sync::Mutex<Store>,
     session_id: String,
     run_id: Option<String>,
     /// Provisioned id for the current tool batch's grouped results entry,
@@ -37,11 +43,16 @@ pub struct StoreJournal {
 impl StoreJournal {
     pub fn new(store: Store, session_id: impl Into<String>) -> Self {
         Self {
-            store,
+            store: std::sync::Mutex::new(store),
             session_id: session_id.into(),
             run_id: None,
             pending_results_entry: None,
         }
+    }
+
+    /// `&mut self` everywhere means the mutex is never contended.
+    fn store(&mut self) -> &mut Store {
+        self.store.get_mut().expect("journal mutex poisoned")
     }
 
     fn run_id(&self) -> Result<&str, JournalError> {
@@ -58,13 +69,14 @@ fn jerr(e: StoreError) -> JournalError {
 #[async_trait::async_trait]
 impl Journal for StoreJournal {
     async fn run_started(&mut self, user: &Message) -> Result<(), JournalError> {
+        let sid = self.session_id.clone();
         let run_id = self
-            .store
-            .start_operation(&self.session_id, &json!({}))
+            .store()
+            .start_operation(&sid, &json!({}))
             .map_err(jerr)?;
-        self.store
+        self.store()
             .append_entry(
-                &self.session_id,
+                &sid,
                 &uuid::Uuid::new_v4().to_string(),
                 "message",
                 &serde_json::to_value(user).map_err(|e| JournalError(e.to_string()))?,
@@ -75,10 +87,11 @@ impl Journal for StoreJournal {
     }
 
     async fn step_attempt(&mut self, attempt: u32) -> Result<(), JournalError> {
+        let sid = self.session_id.clone();
         let run_id = self.run_id()?.to_string();
-        self.store
+        self.store()
             .append_record(
-                &self.session_id,
+                &sid,
                 &format!("{run_id}:step:{attempt}"),
                 &run_id,
                 "step_attempt",
@@ -88,10 +101,11 @@ impl Journal for StoreJournal {
     }
 
     async fn assistant_message(&mut self, message: &Message) -> Result<(), JournalError> {
+        let sid = self.session_id.clone();
         self.run_id()?;
-        self.store
+        self.store()
             .append_entry(
-                &self.session_id,
+                &sid,
                 &uuid::Uuid::new_v4().to_string(),
                 "message",
                 &serde_json::to_value(message).map_err(|e| JournalError(e.to_string()))?,
@@ -100,13 +114,14 @@ impl Journal for StoreJournal {
     }
 
     async fn tool_batch(&mut self, intents: &[ToolIntent]) -> Result<(), JournalError> {
+        let sid = self.session_id.clone();
         let run_id = self.run_id()?.to_string();
         let results_entry_id = uuid::Uuid::new_v4().to_string();
         for intent in intents {
             // Deterministic intent id: a retried batch write stays idempotent.
-            self.store
+            self.store()
                 .append_record(
-                    &self.session_id,
+                    &sid,
                     &format!("{run_id}:tool:{}", intent.tool_use_id),
                     &run_id,
                     "tool_started",
@@ -125,13 +140,14 @@ impl Journal for StoreJournal {
     }
 
     async fn tool_results(&mut self, results: &Message) -> Result<(), JournalError> {
+        let sid = self.session_id.clone();
         let entry_id = self
             .pending_results_entry
             .take()
             .ok_or_else(|| JournalError("tool_results without a pending tool_batch".into()))?;
-        self.store
+        self.store()
             .append_entry(
-                &self.session_id,
+                &sid,
                 &entry_id,
                 "message",
                 &serde_json::to_value(results).map_err(|e| JournalError(e.to_string()))?,
@@ -140,13 +156,15 @@ impl Journal for StoreJournal {
     }
 
     async fn run_finished(&mut self, outcome: RunOutcome, usage: Usage) -> Result<(), JournalError> {
+        let sid = self.session_id.clone();
         let run_id = self.run_id()?.to_string();
-        self.store
-            .finish_operation(&self.session_id, &run_id, outcome.as_str())
+        self.store()
+            .finish_operation(&sid, &run_id, outcome.as_str())
             .map_err(jerr)?;
-        let title = title_from(&self.store.path_messages(&self.session_id).map_err(jerr)?);
-        self.store
-            .update_session_meta(&self.session_id, usage, &title)
+        let path = self.store().path_messages(&sid).map_err(jerr)?;
+        let title = title_from(&path);
+        self.store()
+            .update_session_meta(&sid, usage, &title)
             .map_err(jerr)?;
         self.run_id = None;
         Ok(())
@@ -205,7 +223,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }
         }
-        async fn run(&self, _: &ToolCtx, input: Value) -> Result<String, bullpen_tools::ToolError> {
+        async fn run(&self, _: &ToolCtx, _: &str, input: Value) -> Result<String, bullpen_tools::ToolError> {
             Ok(format!("echo: {}", input["value"]))
         }
     }

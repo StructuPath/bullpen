@@ -42,10 +42,11 @@ impl RunOutcome {
     }
 }
 
-// `Send` only: a journal is owned exclusively by its run (methods take
-// `&mut self`), and SQLite connections are Send but not Sync.
+// `Send + Sync` because agent futures hold `&Agent` across awaits inside
+// Send futures. Implementations over non-Sync resources (SQLite) wrap them
+// in a Mutex; with `&mut self` methods, `get_mut()` makes that lock-free.
 #[async_trait::async_trait]
-pub trait Journal: Send {
+pub trait Journal: Send + Sync {
     /// A run was accepted: record the operation and the user message.
     async fn run_started(&mut self, user: &Message) -> Result<(), JournalError>;
     /// About to make provider request number `attempt` (1-based).

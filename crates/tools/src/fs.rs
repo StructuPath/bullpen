@@ -41,7 +41,7 @@ impl Tool for ReadFile {
         true
     }
 
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let path = resolve_path(ctx, required_str(&input, "path")?);
         let raw = tokio::fs::read(&path)
             .await
@@ -94,7 +94,7 @@ impl Tool for WriteFile {
         }
     }
 
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let path = resolve_path(ctx, required_str(&input, "path")?);
         let content = required_str(&input, "content")?;
         if let Some(parent) = path.parent() {
@@ -135,7 +135,7 @@ impl Tool for EditFile {
         }
     }
 
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let path = resolve_path(ctx, required_str(&input, "path")?);
         let old = required_str(&input, "old_string")?;
         let new = required_str(&input, "new_string")?;
@@ -182,10 +182,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         WriteFile
-            .run(&c, json!({"path": "sub/f.txt", "content": "one\ntwo\nthree"}))
+            .run(&c, "t", json!({"path": "sub/f.txt", "content": "one\ntwo\nthree"}))
             .await
             .unwrap();
-        let out = ReadFile.run(&c, json!({"path": "sub/f.txt"})).await.unwrap();
+        let out = ReadFile.run(&c, "t", json!({"path": "sub/f.txt"})).await.unwrap();
         assert_eq!(out, "1\tone\n2\ttwo\n3\tthree\n");
     }
 
@@ -194,11 +194,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         WriteFile
-            .run(&c, json!({"path": "f.txt", "content": "a\nb\nc\nd"}))
+            .run(&c, "t", json!({"path": "f.txt", "content": "a\nb\nc\nd"}))
             .await
             .unwrap();
         let out = ReadFile
-            .run(&c, json!({"path": "f.txt", "offset": 2, "limit": 2}))
+            .run(&c, "t", json!({"path": "f.txt", "offset": 2, "limit": 2}))
             .await
             .unwrap();
         assert_eq!(out, "2\tb\n3\tc\n");
@@ -209,20 +209,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         WriteFile
-            .run(&c, json!({"path": "f.txt", "content": "x = 1\nx = 1\n"}))
+            .run(&c, "t", json!({"path": "f.txt", "content": "x = 1\nx = 1\n"}))
             .await
             .unwrap();
         let err = EditFile
-            .run(&c, json!({"path": "f.txt", "old_string": "x = 1", "new_string": "x = 2"}))
+            .run(&c, "t", json!({"path": "f.txt", "old_string": "x = 1", "new_string": "x = 2"}))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("2 times"));
 
         EditFile
-            .run(&c, json!({"path": "f.txt", "old_string": "x = 1\nx = 1", "new_string": "x = 2\nx = 1"}))
+            .run(&c, "t", json!({"path": "f.txt", "old_string": "x = 1\nx = 1", "new_string": "x = 2\nx = 1"}))
             .await
             .unwrap();
-        let out = ReadFile.run(&c, json!({"path": "f.txt"})).await.unwrap();
+        let out = ReadFile.run(&c, "t", json!({"path": "f.txt"})).await.unwrap();
         assert!(out.contains("x = 2"));
     }
 
@@ -231,11 +231,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         WriteFile
-            .run(&c, json!({"path": "f.txt", "content": "hello"}))
+            .run(&c, "t", json!({"path": "f.txt", "content": "hello"}))
             .await
             .unwrap();
         let err = EditFile
-            .run(&c, json!({"path": "f.txt", "old_string": "absent", "new_string": "y"}))
+            .run(&c, "t", json!({"path": "f.txt", "old_string": "absent", "new_string": "y"}))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));

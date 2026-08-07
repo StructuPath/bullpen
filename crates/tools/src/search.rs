@@ -43,7 +43,7 @@ impl Tool for Grep {
         true
     }
 
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let pattern = required_str(&input, "pattern")?;
         let re = regex::Regex::new(pattern)
             .map_err(|e| ToolError::InvalidInput(format!("bad regex: {e}")))?;
@@ -126,7 +126,7 @@ impl Tool for Glob {
         true
     }
 
-    async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
+    async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let pattern = required_str(&input, "pattern")?;
         let glob = GlobBuilder::new(pattern)
             .literal_separator(true)
@@ -184,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn grep_finds_matches_with_locations() {
         let (_dir, ctx) = fixture().await;
-        let out = Grep.run(&ctx, json!({"pattern": "steel"})).await.unwrap();
+        let out = Grep.run(&ctx, "t", json!({"pattern": "steel"})).await.unwrap();
         assert!(out.contains("src/main.rs:2:"), "{out}");
         assert!(out.contains("notes.md:1:"), "{out}");
     }
@@ -192,16 +192,16 @@ mod tests {
     #[tokio::test]
     async fn grep_rejects_bad_regex() {
         let (_dir, ctx) = fixture().await;
-        let err = Grep.run(&ctx, json!({"pattern": "["})).await.unwrap_err();
+        let err = Grep.run(&ctx, "t", json!({"pattern": "["})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
 
     #[tokio::test]
     async fn glob_matches_relative_paths() {
         let (_dir, ctx) = fixture().await;
-        let out = Glob.run(&ctx, json!({"pattern": "**/*.rs"})).await.unwrap();
+        let out = Glob.run(&ctx, "t", json!({"pattern": "**/*.rs"})).await.unwrap();
         assert_eq!(out, "src/main.rs");
-        let out = Glob.run(&ctx, json!({"pattern": "*.md"})).await.unwrap();
+        let out = Glob.run(&ctx, "t", json!({"pattern": "*.md"})).await.unwrap();
         assert_eq!(out, "notes.md");
     }
 }

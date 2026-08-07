@@ -36,6 +36,12 @@ it happens. Kill bullpen mid-run (crash, `kill -9`, power loss) and the next
 invocation recovers: interrupted tool calls get marked, the transcript is
 closed cleanly, and the session resumes where it left off.
 
+The same machinery powers **the pen**: the model can delegate bounded tasks
+to child agents via the `agent` tool (`inspect` = read-only, `work` = full
+tools). Children are ordinary sessions — durable, budgeted, listed by
+`bullpen sessions`, resumable — with deterministic identities, so a replayed
+delegation reattaches to its child instead of running it twice.
+
 ## Design
 
 Start with [ARCHITECTURE.md](ARCHITECTURE.md). The one-sentence version:
