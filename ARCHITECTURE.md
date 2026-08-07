@@ -27,7 +27,8 @@ crates above it in this table:
 
 | Crate | Owns | Must never know about |
 |---|---|---|
-| `bullpen-llm` | Provider-neutral conversation types, `Provider` trait, vendor adapters (Anthropic today), shared retry policy | Tools, transcripts, UI |
+| `bullpen-llm` | Provider-neutral conversation types, `Provider` trait, wire-format adapters (Anthropic messages, OpenAI chat-completions, Codex Responses/SSE), shared retry policy | Tools, transcripts, UI |
+| `bullpen-auth` | Credential store (`~/.bullpen/auth.json`, 0600, atomic), PKCE, OpenRouter OAuth, Codex device-code flow + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
 | `bullpen-tools` | `Tool` trait, `Registry`, built-ins (bash, read/write/edit, grep, glob), parallel-safety flags | Providers, the loop |
 | `bullpen-store` | SQLite persistence: sessions, transcripts, usage; schema migrations via `user_version` | Providers, tools, the loop |
 | `bullpen-agent` | The loop: transcript, provider calls, tool continuation, events, max-turns fuse | Config files, sessions, vendors, UI |
@@ -37,6 +38,38 @@ The rule inherited from neo, kept absolute: **the core loop is policy-free.**
 Product capabilities (skills, project context, phases, the pen, workflows,
 TUI) compose around `bullpen-agent` through interfaces and events. If a
 feature needs the loop changed, that's a design smell to justify explicitly.
+
+## Providers and auth
+
+Adapters are organized by **wire format**, not vendor — three formats cover
+every supported provider, and compatible hosts (GLM, Kimi) become config, not
+code:
+
+| Provider | Wire format | Auth | Verified |
+|---|---|---|---|
+| `anthropic` | Anthropic messages | `ANTHROPIC_API_KEY` | wire-level tests only |
+| `openrouter` | OpenAI chat-completions | `bullpen login openrouter` (official OAuth PKCE → API key) or `OPENROUTER_API_KEY` | live, incl. tool round-trip (2026-08-07) |
+| `codex` | OpenAI Responses over SSE | `bullpen login codex` (device-code flow) or read-only borrow of the Codex CLI's `~/.codex/auth.json` | live, incl. tool round-trip and session resume (2026-08-07) |
+
+Contract notes learned the hard way (all verified live against the Codex
+subscription backend, 2026-08-07): it rejects `max_output_tokens`; it rejects
+`gpt-5-codex` for ChatGPT accounts (default comes from `~/.codex/config.toml`
+instead); its `response.completed` event omits `output`, so content is
+assembled from `response.output_item.done` events; and encrypted `reasoning`
+items must be replayed verbatim on later turns.
+
+That last point is why `ContentBlock::Opaque { provider, data }` exists: each
+adapter replays only its own opaque blocks and every other adapter skips them,
+which is what makes cross-provider session resume safe.
+
+The borrowed Codex credential path deliberately **never refreshes** the
+token — a rotation could invalidate the Codex CLI's own session. An expired
+borrow asks the user to run either tool's login. Bullpen's own
+`login codex` credentials refresh proactively and persist rotations.
+
+The `codex` and (borrowed-key) subscription paths use each vendor's
+first-party client flows; whether third-party harness use stays within each
+vendor's terms is the user's call, not a property this code can guarantee.
 
 ## Transcript invariants
 
@@ -71,9 +104,14 @@ prefix.
 
 Milestones, in order. Each lands as its own crate or a bounded extension:
 
+- ~~**M1.5 — Auth + multi-provider.**~~ Landed 2026-08-07: OpenRouter (OAuth
+  PKCE) and Codex (device-code + CLI borrow) alongside Anthropic. Remaining
+  from this line: GLM/Kimi as config-only Anthropic-compatible endpoints, and
+  a stored-key path for Anthropic itself.
 - **M1 — Streaming + prompt caching.** SSE streaming in the Anthropic
   adapter; cache-control breakpoints on the system block. Event stream grows
-  text deltas.
+  text deltas. (The Codex adapter already consumes SSE but buffers it;
+  incremental deltas land here too.)
 - **M2 — The pen (durable subagents).** `pen` crate: supervisor with budgets
   (count, wall-clock, tokens), each child a fresh `Agent` persisted as an
   `agent_runs` row + own transcript. Children survive process exit and are

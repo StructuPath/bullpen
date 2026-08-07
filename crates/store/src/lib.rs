@@ -30,6 +30,7 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub cwd: String,
+    pub provider: String,
     pub model: String,
     pub usage: Usage,
     pub created_at: String,
@@ -91,14 +92,27 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 2 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'anthropic';
+                 PRAGMA user_version = 2;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
-    pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session, StoreError> {
+    pub fn create_session(
+        &self,
+        cwd: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<Session, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO sessions (id, cwd, model) VALUES (?1, ?2, ?3)",
-            params![id, cwd, model],
+            "INSERT INTO sessions (id, cwd, provider, model) VALUES (?1, ?2, ?3, ?4)",
+            params![id, cwd, provider, model],
         )?;
         self.get_session(&id)
     }
@@ -166,7 +180,7 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Session, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, title, cwd, model, input_tokens, output_tokens,
+                "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
                         created_at, updated_at
                  FROM sessions WHERE id = ?1",
                 params![id],
@@ -181,7 +195,7 @@ impl Store {
     /// Resolve a full id or unique id prefix.
     pub fn resolve_session(&self, prefix: &str) -> Result<Session, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, cwd, model, input_tokens, output_tokens,
+            "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
                     created_at, updated_at
              FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2",
         )?;
@@ -218,7 +232,7 @@ impl Store {
 
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, cwd, model, input_tokens, output_tokens,
+            "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
                     created_at, updated_at
              FROM sessions ORDER BY updated_at DESC",
         )?;
@@ -234,13 +248,14 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         id: row.get(0)?,
         title: row.get(1)?,
         cwd: row.get(2)?,
-        model: row.get(3)?,
+        provider: row.get(3)?,
+        model: row.get(4)?,
         usage: Usage {
-            input_tokens: row.get::<_, i64>(4)? as u64,
-            output_tokens: row.get::<_, i64>(5)? as u64,
+            input_tokens: row.get::<_, i64>(5)? as u64,
+            output_tokens: row.get::<_, i64>(6)? as u64,
         },
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -280,7 +295,7 @@ mod tests {
     #[test]
     fn transcript_roundtrip_preserves_blocks() {
         let (_dir, mut store) = store();
-        let session = store.create_session("/tmp", "claude-sonnet-5").unwrap();
+        let session = store.create_session("/tmp", "anthropic", "claude-sonnet-5").unwrap();
         let messages = sample_messages();
         store
             .save_transcript(
@@ -301,7 +316,7 @@ mod tests {
     #[test]
     fn resave_replaces_not_duplicates() {
         let (_dir, mut store) = store();
-        let session = store.create_session("/tmp", "m").unwrap();
+        let session = store.create_session("/tmp", "anthropic", "m").unwrap();
         let mut messages = sample_messages();
         store
             .save_transcript(&session.id, &messages, Usage::default())
@@ -316,7 +331,7 @@ mod tests {
     #[test]
     fn prefix_resolution() {
         let (_dir, store) = store();
-        let s = store.create_session("/tmp", "m").unwrap();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
         let found = store.resolve_session(&s.id[..8]).unwrap();
         assert_eq!(found.id, s.id);
         assert!(matches!(
@@ -343,7 +358,7 @@ mod tests {
         let mut a = Store::open(&path).unwrap();
         let b = Store::open(&path).unwrap();
 
-        let s = a.create_session("/tmp", "m").unwrap();
+        let s = a.create_session("/tmp", "anthropic", "m").unwrap();
         a.save_transcript(&s.id, &sample_messages(), Usage::default())
             .unwrap();
         assert_eq!(b.list_sessions().unwrap().len(), 1);

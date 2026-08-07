@@ -10,10 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 bullpen-agent.workspace = true
+bullpen-auth.workspace = true
 bullpen-llm.workspace = true
 bullpen-store.workspace = true
 bullpen-tools.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

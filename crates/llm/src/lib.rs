@@ -6,7 +6,10 @@
 //! above this crate knows what vendor is in use.
 
 pub mod anthropic;
+pub mod chatcompletions;
+pub mod codex;
 mod retry;
+mod sse;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +39,14 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
         is_error: bool,
+    },
+    /// Provider-specific data that must be replayed verbatim on later turns
+    /// (e.g. Codex encrypted reasoning items). Tagged with the producing
+    /// provider so each adapter replays only its own blocks; everything else
+    /// skips them, which is what makes cross-provider session resume safe.
+    Opaque {
+        provider: String,
+        data: Value,
     },
 }
 
@@ -142,6 +153,8 @@ pub enum ProviderError {
     Api { status: u16, message: String },
     #[error("malformed response: {0}")]
     Malformed(String),
+    #[error("{0}")]
+    Failure(String),
 }
 
 #[async_trait::async_trait]

@@ -174,12 +174,20 @@ fn to_wire(req: &Request) -> Value {
     let messages = req
         .messages
         .iter()
-        .map(|m| WireMessage {
-            role: match m.role {
-                crate::Role::User => "user".to_string(),
-                crate::Role::Assistant => "assistant".to_string(),
-            },
-            content: m.content.iter().map(block_to_wire).collect(),
+        .filter_map(|m| {
+            let content: Vec<WireBlock> = m.content.iter().filter_map(block_to_wire).collect();
+            // A message left empty after dropping foreign opaque blocks would
+            // be rejected by the API; skip it entirely.
+            if content.is_empty() {
+                return None;
+            }
+            Some(WireMessage {
+                role: match m.role {
+                    crate::Role::User => "user".to_string(),
+                    crate::Role::Assistant => "assistant".to_string(),
+                },
+                content,
+            })
         })
         .collect();
 
@@ -193,23 +201,26 @@ fn to_wire(req: &Request) -> Value {
     serde_json::to_value(&wire).expect("wire request serializes")
 }
 
-fn block_to_wire(block: &ContentBlock) -> WireBlock {
+fn block_to_wire(block: &ContentBlock) -> Option<WireBlock> {
     match block {
-        ContentBlock::Text { text } => WireBlock::Text { text: text.clone() },
-        ContentBlock::ToolUse { id, name, input } => WireBlock::ToolUse {
+        ContentBlock::Text { text } => Some(WireBlock::Text { text: text.clone() }),
+        ContentBlock::ToolUse { id, name, input } => Some(WireBlock::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
-        },
+        }),
         ContentBlock::ToolResult {
             tool_use_id,
             content,
             is_error,
-        } => WireBlock::ToolResult {
+        } => Some(WireBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
             is_error: *is_error,
-        },
+        }),
+        // Another provider's replay data; this adapter neither produces nor
+        // sends opaque blocks.
+        ContentBlock::Opaque { .. } => None,
     }
 }
 

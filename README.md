@@ -12,14 +12,22 @@ subagents, OS sandboxing, and the workflow engine are on the
 ## Use
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
 cargo install --path crates/cli
+
+# Pick your provider(s):
+export ANTHROPIC_API_KEY=sk-ant-...   # anthropic (default)
+bullpen login openrouter              # OpenRouter, official OAuth PKCE
+bullpen login codex                   # ChatGPT subscription, device-code flow
+# ...or skip codex login entirely: bullpen borrows a logged-in Codex CLI's
+# session (~/.codex/auth.json) read-only.
 
 cd your-project
 bullpen run "find the failing test, explain why it fails"
-bullpen run -v "..."          # show tool activity
-bullpen sessions              # list stored sessions
-bullpen run -r <id-prefix> "follow-up question"
+bullpen run -p codex "..."            # ChatGPT subscription
+bullpen run -p openrouter -m "anthropic/claude-sonnet-4.5" "..."
+bullpen run -v "..."                  # show tool activity
+bullpen sessions                      # list stored sessions
+bullpen run -r <id-prefix> "follow-up question"   # resumes with the session's provider
 ```
 
 Sessions persist in `~/.bullpen/bullpen.db` (SQLite, WAL) and are saved after
