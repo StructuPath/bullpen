@@ -35,7 +35,7 @@ impl Tool for Grep {
         }
     }
 
-    fn parallel_safe(&self) -> bool {
+    fn parallel_safe(&self, _input: &Value) -> bool {
         true
     }
 
@@ -118,7 +118,7 @@ impl Tool for Glob {
         }
     }
 
-    fn parallel_safe(&self) -> bool {
+    fn parallel_safe(&self, _input: &Value) -> bool {
         true
     }
 

@@ -203,9 +203,19 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   pen. Budgets are durable: child count is a database count (default 20), a
   crash-restart loop cannot reset it; 15-minute wall clock per child run.
   Children appear in `bullpen sessions` (`└ child of …`) and resume with
-  `run -r` like any session. Still open for M2.x: parallel scheduling of
-  inspect children, live child event streaming to the parent's UI, token
-  budgets (needs the usage ledger).
+  `run -r` like any session.
+
+  **Parallel scheduling** (landed same day): within one assistant response,
+  maximal *adjacent* runs of parallel-safe tool calls execute concurrently
+  under a semaphore (default 8); results always enter the transcript in
+  request order. `Tool::parallel_safe` judges the concrete input — the
+  runtime owns the decision, never the model. Read/grep/glob are
+  parallel-safe; bash and writes are serial; the `agent` tool is
+  parallel-safe only in `inspect` mode. Durability is unchanged by
+  scheduling: the whole batch's intents are journaled before any execution,
+  and a crash mid-batch synthesizes the whole batch on recovery. Still open
+  for M2.x: live child event streaming to the parent's UI, token budgets
+  (needs the usage ledger).
 - **M3 — Sandbox + permissions.** `sandbox` crate: capability grants (fs
   read/write path sets, network, process spawn) resolved per tool call;
   Seatbelt profile generation on macOS, Landlock on Linux. Approvals become

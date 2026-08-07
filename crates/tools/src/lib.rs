@@ -40,9 +40,11 @@ pub enum ToolError {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn spec(&self) -> ToolSpec;
-    /// Whether this tool is safe to run concurrently with other parallel-safe
-    /// calls. Mutating tools and shell execution stay serial. Defaults closed.
-    fn parallel_safe(&self) -> bool {
+    /// Whether this concrete invocation is safe to run concurrently with
+    /// other parallel-safe calls. The runtime owns this decision — model-
+    /// supplied arguments cannot declare themselves parallel-safe. Mutating
+    /// tools and shell execution stay serial. Defaults closed.
+    fn parallel_safe(&self, _input: &Value) -> bool {
         false
     }
     /// Whether re-executing this tool with the same input after a crash is

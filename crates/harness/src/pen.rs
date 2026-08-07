@@ -141,6 +141,14 @@ impl Tool for PenTool {
         }
     }
 
+    fn parallel_safe(&self, input: &Value) -> bool {
+        // Inspect children are read-only in the workspace and each writes
+        // only to its own child session (WAL handles the store contention),
+        // so they can run alongside each other. Work children mutate the
+        // workspace and stay serial.
+        input.get("mode").and_then(Value::as_str).unwrap_or("inspect") == "inspect"
+    }
+
     async fn run(&self, _ctx: &ToolCtx, call_id: &str, input: Value) -> Result<String, ToolError> {
         let prompt = input
             .get("prompt")
@@ -297,6 +305,15 @@ mod tests {
         ToolCtx {
             workspace: std::env::temp_dir(),
         }
+    }
+
+    #[test]
+    fn inspect_children_are_parallel_safe_work_children_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let pen = PenTool::new(FakeProvider::new(vec![]), "p", config(&dir));
+        assert!(pen.parallel_safe(&json!({"mode": "inspect", "prompt": "x"})));
+        assert!(pen.parallel_safe(&json!({"prompt": "x"}))); // default mode
+        assert!(!pen.parallel_safe(&json!({"mode": "work", "prompt": "x"})));
     }
 
     #[test]

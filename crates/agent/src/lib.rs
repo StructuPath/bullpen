@@ -35,6 +35,8 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     /// Runaway-loop fuse, not a work budget.
     pub max_turns: u32,
+    /// Concurrency cap for adjacent parallel-safe tool calls in one batch.
+    pub max_parallel_tools: usize,
 }
 
 impl Default for AgentConfig {
@@ -44,6 +46,7 @@ impl Default for AgentConfig {
             system: String::new(),
             max_tokens: 8_192,
             max_turns: 500,
+            max_parallel_tools: 8,
         }
     }
 }
@@ -242,33 +245,20 @@ impl Agent {
                 };
             }
 
-            // Intents become durable before any tool effect starts.
+            // Intents become durable before any tool effect starts —
+            // regardless of how the batch is scheduled below.
             self.journal.tool_batch(&intents).await?;
 
-            // Execute every requested tool and build results in request order
-            // BEFORE committing anything to the in-memory transcript.
-            let mut results = Vec::with_capacity(intents.len());
-            for intent in &intents {
-                self.emit(Event::ToolStart {
-                    id: intent.tool_use_id.clone(),
-                    name: intent.name.clone(),
-                    input: intent.input.clone(),
-                });
-                let (output, is_error) = self
-                    .run_tool(&intent.name, &intent.tool_use_id, intent.input.clone())
-                    .await;
-                self.emit(Event::ToolEnd {
-                    id: intent.tool_use_id.clone(),
-                    name: intent.name.clone(),
-                    output: output.clone(),
-                    is_error,
-                });
-                results.push(ContentBlock::ToolResult {
+            let outputs = self.execute_batch(&intents).await;
+            let results: Vec<ContentBlock> = intents
+                .iter()
+                .zip(outputs)
+                .map(|(intent, (output, is_error))| ContentBlock::ToolResult {
                     tool_use_id: intent.tool_use_id.clone(),
                     content: cap_result(output),
                     is_error,
-                });
-            }
+                })
+                .collect();
 
             let results = Message::tool_results(results);
             self.journal.tool_results(&results).await?;
@@ -277,6 +267,71 @@ impl Agent {
         }
 
         Err(AgentError::MaxTurns(self.config.max_turns))
+    }
+
+    /// Execute one batch of tool calls and return outputs in request order.
+    ///
+    /// Scheduling follows the rule the runtime owns: maximal *adjacent* runs
+    /// of parallel-safe calls (per [`bullpen_tools::Tool::parallel_safe`],
+    /// judged against the concrete input) execute concurrently under a
+    /// semaphore; everything else — mutating tools, shell, unknown tools —
+    /// runs serially in place. Events fire as execution happens (completion
+    /// order); results always return in request order, which is the order
+    /// they enter the transcript.
+    async fn execute_batch(&self, intents: &[ToolIntent]) -> Vec<(String, bool)> {
+        let parallel: Vec<bool> = intents
+            .iter()
+            .map(|i| {
+                self.registry
+                    .get(&i.name)
+                    .is_some_and(|t| t.parallel_safe(&i.input))
+            })
+            .collect();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_parallel_tools.max(1),
+        ));
+
+        let mut outputs: Vec<(String, bool)> = Vec::with_capacity(intents.len());
+        let mut idx = 0;
+        while idx < intents.len() {
+            if parallel[idx] {
+                let mut end = idx + 1;
+                while end < intents.len() && parallel[end] {
+                    end += 1;
+                }
+                let group = intents[idx..end].iter().map(|intent| {
+                    let semaphore = semaphore.clone();
+                    async move {
+                        let _permit = semaphore.acquire().await.expect("semaphore open");
+                        self.run_tool_with_events(intent).await
+                    }
+                });
+                outputs.extend(futures::future::join_all(group).await);
+                idx = end;
+            } else {
+                outputs.push(self.run_tool_with_events(&intents[idx]).await);
+                idx += 1;
+            }
+        }
+        outputs
+    }
+
+    async fn run_tool_with_events(&self, intent: &ToolIntent) -> (String, bool) {
+        self.emit(Event::ToolStart {
+            id: intent.tool_use_id.clone(),
+            name: intent.name.clone(),
+            input: intent.input.clone(),
+        });
+        let (output, is_error) = self
+            .run_tool(&intent.name, &intent.tool_use_id, intent.input.clone())
+            .await;
+        self.emit(Event::ToolEnd {
+            id: intent.tool_use_id.clone(),
+            name: intent.name.clone(),
+            output: output.clone(),
+            is_error,
+        });
+        (output, is_error)
     }
 
     async fn run_tool(&self, name: &str, call_id: &str, input: serde_json::Value) -> (String, bool) {
@@ -508,6 +563,143 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Sleeps, and records how many instances ran at once.
+    struct SlowTool {
+        safe: bool,
+        delay_ms: u64,
+        current: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl bullpen_tools::Tool for SlowTool {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "slow".into(),
+                description: "slow".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn parallel_safe(&self, _input: &serde_json::Value) -> bool {
+            self.safe
+        }
+        async fn run(
+            &self,
+            _ctx: &ToolCtx,
+            _call_id: &str,
+            input: serde_json::Value,
+        ) -> Result<String, bullpen_tools::ToolError> {
+            use std::sync::atomic::Ordering;
+            let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            Ok(format!("slow:{}", input["tag"]))
+        }
+    }
+
+    /// One assistant response requesting several `slow` calls.
+    fn multi_tool_response(tags: &[u64]) -> Response {
+        Response {
+            content: tags
+                .iter()
+                .map(|t| ContentBlock::ToolUse {
+                    id: format!("tu_{t}"),
+                    name: "slow".into(),
+                    input: json!({"tag": t}),
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        }
+    }
+
+    fn slow_agent(
+        provider: Arc<FakeProvider>,
+        safe: bool,
+        max_parallel: usize,
+    ) -> (Agent, Arc<std::sync::atomic::AtomicUsize>) {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        registry.register(Arc::new(SlowTool {
+            safe,
+            delay_ms: 40,
+            current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: peak.clone(),
+        }));
+        let agent = Agent::new(
+            provider,
+            registry,
+            ToolCtx {
+                workspace: std::env::temp_dir(),
+            },
+            AgentConfig {
+                model: "test".into(),
+                system: "test".into(),
+                max_parallel_tools: max_parallel,
+                ..Default::default()
+            },
+        );
+        (agent, peak)
+    }
+
+    fn batch_results(agent: &Agent) -> Vec<String> {
+        agent.messages()[2]
+            .content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => content.clone(),
+                other => panic!("expected result, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_batch_overlaps_and_keeps_request_order() {
+        let provider = FakeProvider::new(vec![
+            multi_tool_response(&[1, 2, 3]),
+            text_response("done", StopReason::EndTurn),
+        ]);
+        let (mut agent, peak) = slow_agent(provider, true, 8);
+        agent.send("go").await.unwrap();
+
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "parallel-safe calls never overlapped"
+        );
+        assert_eq!(batch_results(&agent), vec!["slow:1", "slow:2", "slow:3"]);
+    }
+
+    #[tokio::test]
+    async fn unsafe_batch_stays_serial() {
+        let provider = FakeProvider::new(vec![
+            multi_tool_response(&[1, 2, 3]),
+            text_response("done", StopReason::EndTurn),
+        ]);
+        let (mut agent, peak) = slow_agent(provider, false, 8);
+        agent.send("go").await.unwrap();
+
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(batch_results(&agent), vec!["slow:1", "slow:2", "slow:3"]);
+    }
+
+    #[tokio::test]
+    async fn semaphore_bounds_parallelism() {
+        let provider = FakeProvider::new(vec![
+            multi_tool_response(&[1, 2, 3, 4]),
+            text_response("done", StopReason::EndTurn),
+        ]);
+        let (mut agent, peak) = slow_agent(provider, true, 1);
+        agent.send("go").await.unwrap();
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Records the journal protocol calls in order.

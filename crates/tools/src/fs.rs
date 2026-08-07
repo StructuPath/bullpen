@@ -33,7 +33,7 @@ impl Tool for ReadFile {
         }
     }
 
-    fn parallel_safe(&self) -> bool {
+    fn parallel_safe(&self, _input: &Value) -> bool {
         true
     }
 
