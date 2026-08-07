@@ -37,6 +37,10 @@ impl Tool for ReadFile {
         true
     }
 
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
         let path = resolve_path(ctx, required_str(&input, "path")?);
         let raw = tokio::fs::read(&path)

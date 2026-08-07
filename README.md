@@ -30,8 +30,11 @@ bullpen sessions                      # list stored sessions
 bullpen run -r <id-prefix> "follow-up question"   # resumes with the session's provider
 ```
 
-Sessions persist in `~/.bullpen/bullpen.db` (SQLite, WAL) and are saved after
-every turn — including failed ones — so anything is resumable.
+Sessions persist in `~/.bullpen/bullpen.db` (SQLite, WAL) as an append-only
+entry tree plus an execution log — every step of a run is durable the moment
+it happens. Kill bullpen mid-run (crash, `kill -9`, power loss) and the next
+invocation recovers: interrupted tool calls get marked, the transcript is
+closed cleanly, and the session resumes where it left off.
 
 ## Design
 

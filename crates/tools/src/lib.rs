@@ -45,6 +45,12 @@ pub trait Tool: Send + Sync {
     fn parallel_safe(&self) -> bool {
         false
     }
+    /// Whether re-executing this tool with the same input after a crash is
+    /// safe (no side effects). Snapshotted into durability intent records.
+    /// Defaults closed.
+    fn replay_safe(&self) -> bool {
+        false
+    }
     async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError>;
 }
 

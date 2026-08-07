@@ -39,6 +39,10 @@ impl Tool for Grep {
         true
     }
 
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, ctx: &ToolCtx, input: Value) -> Result<String, ToolError> {
         let pattern = required_str(&input, "pattern")?;
         let re = regex::Regex::new(pattern)
@@ -115,6 +119,10 @@ impl Tool for Glob {
     }
 
     fn parallel_safe(&self) -> bool {
+        true
+    }
+
+    fn replay_safe(&self) -> bool {
         true
     }
 

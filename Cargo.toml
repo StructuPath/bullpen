@@ -6,6 +6,7 @@ members = [
     "crates/tools",
     "crates/agent",
     "crates/store",
+    "crates/harness",
     "crates/cli",
 ]
 
@@ -40,6 +41,7 @@ bullpen-auth = { path = "crates/auth" }
 bullpen-tools = { path = "crates/tools" }
 bullpen-agent = { path = "crates/agent" }
 bullpen-store = { path = "crates/store" }
+bullpen-harness = { path = "crates/harness" }
 
 [profile.release]
 lto = "thin"

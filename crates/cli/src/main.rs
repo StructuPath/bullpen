@@ -261,16 +261,14 @@ async fn run(
     let cwd = std::env::current_dir()?;
     let mut store = Store::open(&Store::default_path())?;
 
-    let (session, transcript, usage, provider_kind, model) = match &resume {
+    let (session, provider_kind, model) = match &resume {
         Some(prefix) => {
             let session = store.resolve_session(prefix)?;
-            let transcript = store.load_transcript(&session.id)?;
-            let usage = session.usage;
             let kind = ProviderKind::from_name(&session.provider).with_context(|| {
                 format!("session uses unknown provider `{}`", session.provider)
             })?;
             let model = session.model.clone();
-            (session, transcript, usage, kind, model)
+            (session, kind, model)
         }
         None => {
             let model = model.unwrap_or_else(|| provider_kind.default_model());
@@ -279,9 +277,22 @@ async fn run(
                 provider_kind.name(),
                 &model,
             )?;
-            (session, Vec::new(), Default::default(), provider_kind, model)
+            (session, provider_kind, model)
         }
     };
+
+    // Recover any run a previous process left open, then rebuild the
+    // transcript from the durable entry tree.
+    let (transcript, recovery) = bullpen_harness::prepare_session(&mut store, &session.id)?;
+    if let Some(r) = &recovery {
+        eprintln!(
+            "[recovered interrupted run {}: {} tool call(s) marked interrupted]",
+            &r.run_id[..8],
+            r.interrupted_tools
+        );
+    }
+    let usage = store.get_session(&session.id)?.usage;
+    drop(store);
 
     let provider = build_provider(provider_kind)?;
     let config = AgentConfig {
@@ -310,15 +321,19 @@ async fn run(
     let tool_ctx = ToolCtx {
         workspace: cwd.clone(),
     };
+    // The journal persists every step of the run as it happens (its own
+    // store handle; WAL makes the two connections safe). If the process
+    // dies mid-run, the next invocation recovers from the durable state.
+    let journal = bullpen_harness::StoreJournal::new(
+        Store::open(&Store::default_path())?,
+        &session.id,
+    );
     let mut agent = Agent::new(provider, Registry::standard(), tool_ctx, config)
         .with_transcript(transcript, usage)
-        .with_events(tx);
+        .with_events(tx)
+        .with_journal(Box::new(journal));
 
     let result = agent.send(&prompt).await;
-
-    // Persist whatever happened — including a transcript cut short by an
-    // error — so the session is always resumable.
-    store.save_transcript(&session.id, agent.messages(), agent.usage())?;
     let usage = agent.usage();
     // The agent owns the event sender; it must drop before the printer's
     // receive loop can end, or this await never returns.

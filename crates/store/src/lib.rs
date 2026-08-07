@@ -1,15 +1,31 @@
 //! Durable local state.
 //!
-//! One SQLite database in WAL mode replaces neo-style per-session JSON files.
-//! WAL gives cross-process safety: concurrent bullpen processes share the
-//! store without losing updates (neo's known limitation #2). The schema is
-//! versioned via `user_version` and will grow tables for agent runs and
-//! workflow state in later milestones.
+//! One SQLite database in WAL mode. Schema v3 implements the durable
+//! execution model from ARCHITECTURE.md ("Persistence and durable
+//! execution"):
+//!
+//! - **entries**: the conversation, an append-only tree (`id`/`parent_id`)
+//!   per session with a per-lane leaf pointer. What the model sees.
+//! - **records**: the execution log (operation/step/tool intents and
+//!   outcomes). Never enters model context; nothing reads it during normal
+//!   execution. Deleting every record leaves a valid conversation.
+//!
+//! Both share one per-session monotonic `seq` allocated inside the write.
+//! Appends are idempotent on the caller-provisioned id, which is what makes
+//! re-running recovery safe.
+
+mod recovery;
+
+pub use recovery::{Recovery, recover};
 
 use std::path::{Path, PathBuf};
 
-use bullpen_llm::{ContentBlock, Message, Role, Usage};
-use rusqlite::{Connection, params};
+use bullpen_llm::{Message, Role, Usage};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const MAIN_LANE: &str = "main";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -23,6 +39,8 @@ pub enum StoreError {
     NotFound(String),
     #[error("session id `{0}` is ambiguous")]
     Ambiguous(String),
+    #[error("corrupt session state: {0}")]
+    Corrupt(String),
 }
 
 #[derive(Debug, Clone)]
@@ -37,12 +55,42 @@ pub struct Session {
     pub updated_at: String,
 }
 
+/// One conversation entry. `payload` holds a [`Message`] for kind
+/// `"message"`; future kinds (compaction) carry their own payloads.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub seq: i64,
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// An execution record. `run_id` is the owning operation's id (which is the
+/// `operation_started` record's own id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Record {
+    pub id: String,
+    pub run_id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// A suspended run discovered by reduction: an `operation_started` with no
+/// matching `operation_finished`.
+#[derive(Debug, Clone)]
+pub struct OpenRun {
+    pub run_id: String,
+    pub source_leaf_id: Option<String>,
+    pub records: Vec<Record>,
+}
+
 pub struct Store {
     conn: Connection,
 }
 
 impl Store {
-    /// Open (creating if needed) the database at `path`.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -56,7 +104,6 @@ impl Store {
         Ok(store)
     }
 
-    /// The default store location: `~/.bullpen/bullpen.db`.
     pub fn default_path() -> PathBuf {
         std::env::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -100,8 +147,49 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 3 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 1;
+                 CREATE TABLE entries (
+                    id         TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    parent_id  TEXT,
+                    seq        INTEGER NOT NULL,
+                    kind       TEXT NOT NULL,
+                    payload    TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE (session_id, seq)
+                 );
+                 CREATE INDEX entries_by_session ON entries(session_id, parent_id);
+                 CREATE TABLE records (
+                    id         TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    lane       TEXT NOT NULL DEFAULT 'main',
+                    run_id     TEXT NOT NULL,
+                    seq        INTEGER NOT NULL,
+                    kind       TEXT NOT NULL,
+                    payload    TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE (session_id, seq)
+                 );
+                 CREATE INDEX records_by_run ON records(session_id, run_id);
+                 CREATE TABLE lanes (
+                    session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    name              TEXT NOT NULL DEFAULT 'main',
+                    leaf_id           TEXT,
+                    open_operation_id TEXT,
+                    PRIMARY KEY (session_id, name)
+                 );",
+            )?;
+            migrate_messages_to_entries(&tx)?;
+            tx.execute_batch("DROP TABLE messages; PRAGMA user_version = 3;")?;
+            tx.commit()?;
+        }
         Ok(())
     }
+
+    // ── Sessions ────────────────────────────────────────────────────────────
 
     pub fn create_session(
         &self,
@@ -114,67 +202,11 @@ impl Store {
             "INSERT INTO sessions (id, cwd, provider, model) VALUES (?1, ?2, ?3, ?4)",
             params![id, cwd, provider, model],
         )?;
+        self.conn.execute(
+            "INSERT INTO lanes (session_id, name) VALUES (?1, ?2)",
+            params![id, MAIN_LANE],
+        )?;
         self.get_session(&id)
-    }
-
-    /// Replace the stored transcript for a session in one transaction and
-    /// roll the usage/title/updated_at metadata forward.
-    pub fn save_transcript(
-        &mut self,
-        session_id: &str,
-        messages: &[Message],
-        usage: Usage,
-    ) -> Result<(), StoreError> {
-        let title = messages
-            .iter()
-            .find(|m| m.role == Role::User)
-            .map(|m| {
-                let t = m.text();
-                t.chars().take(80).collect::<String>()
-            })
-            .unwrap_or_default();
-
-        let tx = self.conn.transaction()?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-            params![session_id],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::NotFound(session_id.to_string()));
-        }
-        tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO messages (session_id, idx, role, content) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (idx, msg) in messages.iter().enumerate() {
-                let role = match msg.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                };
-                let content = serde_json::to_string(&msg.content)?;
-                insert.execute(params![session_id, idx as i64, role, content])?;
-            }
-        }
-        tx.execute(
-            "UPDATE sessions
-             SET input_tokens = ?2, output_tokens = ?3,
-                 title = CASE WHEN title = '' THEN ?4 ELSE title END,
-                 updated_at = datetime('now')
-             WHERE id = ?1",
-            params![
-                session_id,
-                usage.input_tokens as i64,
-                usage.output_tokens as i64,
-                title
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn get_session(&self, id: &str) -> Result<Session, StoreError> {
@@ -192,7 +224,6 @@ impl Store {
             })
     }
 
-    /// Resolve a full id or unique id prefix.
     pub fn resolve_session(&self, prefix: &str) -> Result<Session, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
@@ -209,38 +240,321 @@ impl Store {
         }
     }
 
-    pub fn load_transcript(&self, session_id: &str) -> Result<Vec<Message>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY idx",
-        )?;
-        let rows = stmt.query_map(params![session_id], |row| {
-            let role: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            Ok((role, content))
-        })?;
-        let mut messages = Vec::new();
-        for row in rows {
-            let (role, content) = row?;
-            let blocks: Vec<ContentBlock> = serde_json::from_str(&content)?;
-            messages.push(Message {
-                role: if role == "user" { Role::User } else { Role::Assistant },
-                content: blocks,
-            });
-        }
-        Ok(messages)
-    }
-
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
                     created_at, updated_at
              FROM sessions ORDER BY updated_at DESC",
         )?;
-        let sessions = stmt
+        Ok(stmt
             .query_map([], row_to_session)?
-            .collect::<Result<_, _>>()?;
-        Ok(sessions)
+            .collect::<Result<_, _>>()?)
     }
+
+    /// Roll cumulative usage and (first-user-message) title forward.
+    pub fn update_session_meta(
+        &self,
+        session_id: &str,
+        usage: Usage,
+        title: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions
+             SET input_tokens = ?2, output_tokens = ?3,
+                 title = CASE WHEN title = '' THEN ?4 ELSE title END,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![
+                session_id,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                title
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ── Entries (the conversation tree) ─────────────────────────────────────
+
+    /// Append an entry with a caller-provisioned id at the lane leaf and
+    /// advance the leaf. Idempotent: if the id already exists, nothing is
+    /// written. Callers never pass a parent — the leaf is the parent.
+    pub fn append_entry(
+        &mut self,
+        session_id: &str,
+        provisioned_id: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)",
+            params![provisioned_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let parent: Option<String> = tx.query_row(
+                "SELECT leaf_id FROM lanes WHERE session_id = ?1 AND name = ?2",
+                params![session_id, MAIN_LANE],
+                |r| r.get(0),
+            )?;
+            let seq = next_seq(&tx, session_id)?;
+            tx.execute(
+                "INSERT INTO entries (id, session_id, parent_id, seq, kind, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![provisioned_id, session_id, parent, seq, kind, payload.to_string()],
+            )?;
+            tx.execute(
+                "UPDATE lanes SET leaf_id = ?3 WHERE session_id = ?1 AND name = ?2",
+                params![session_id, MAIN_LANE, provisioned_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn leaf(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT leaf_id FROM lanes WHERE session_id = ?1 AND name = ?2",
+                params![session_id, MAIN_LANE],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn entry_exists(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The active path, root → leaf.
+    pub fn path(&self, session_id: &str) -> Result<Vec<Entry>, StoreError> {
+        let mut by_id = std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, parent_id, seq, kind, payload FROM entries WHERE session_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(Entry {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    seq: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload: serde_json::from_str(&row.get::<_, String>(4)?)
+                        .unwrap_or(Value::Null),
+                })
+            })?;
+            for row in rows {
+                let e = row?;
+                by_id.insert(e.id.clone(), e);
+            }
+        }
+        let mut path = Vec::new();
+        let mut cursor = self.leaf(session_id)?;
+        while let Some(id) = cursor {
+            let entry = by_id
+                .remove(&id)
+                .ok_or_else(|| StoreError::Corrupt(format!("leaf path references missing entry {id}")))?;
+            cursor = entry.parent_id.clone();
+            path.push(entry);
+        }
+        path.reverse();
+        Ok(path)
+    }
+
+    /// The active path as provider messages (kind `"message"` only).
+    pub fn path_messages(&self, session_id: &str) -> Result<Vec<Message>, StoreError> {
+        self.path(session_id)?
+            .into_iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| serde_json::from_value(e.payload).map_err(StoreError::from))
+            .collect()
+    }
+
+    // ── Records (the execution log) ─────────────────────────────────────────
+
+    /// Append an execution record. Idempotent on `id`.
+    pub fn append_record(
+        &mut self,
+        session_id: &str,
+        id: &str,
+        run_id: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let seq = next_seq(&tx, session_id)?;
+            tx.execute(
+                "INSERT INTO records (id, session_id, lane, run_id, seq, kind, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, session_id, MAIN_LANE, run_id, seq, kind, payload.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Open a new operation: `operation_started` record (its id IS the run
+    /// id) plus the lane's open-operation marker.
+    pub fn start_operation(
+        &mut self,
+        session_id: &str,
+        payload: &Value,
+    ) -> Result<String, StoreError> {
+        if self.open_run(session_id)?.is_some() {
+            return Err(StoreError::Corrupt(
+                "cannot start an operation while one is open (recover first)".into(),
+            ));
+        }
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut payload = payload.clone();
+        payload["source_leaf_id"] = match self.leaf(session_id)? {
+            Some(id) => Value::String(id),
+            None => Value::Null,
+        };
+        self.append_record(session_id, &run_id.clone(), &run_id, "operation_started", &payload)?;
+        self.conn.execute(
+            "UPDATE lanes SET open_operation_id = ?3 WHERE session_id = ?1 AND name = ?2",
+            params![session_id, MAIN_LANE, run_id],
+        )?;
+        Ok(run_id)
+    }
+
+    /// Close an operation and clear the lane marker. Idempotent.
+    pub fn finish_operation(
+        &mut self,
+        session_id: &str,
+        run_id: &str,
+        outcome: &str,
+    ) -> Result<(), StoreError> {
+        let finish_id = format!("{run_id}:finished");
+        self.append_record(
+            session_id,
+            &finish_id,
+            run_id,
+            "operation_finished",
+            &serde_json::json!({ "outcome": outcome }),
+        )?;
+        self.conn.execute(
+            "UPDATE lanes SET open_operation_id = NULL
+             WHERE session_id = ?1 AND name = ?2 AND open_operation_id = ?3",
+            params![session_id, MAIN_LANE, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reduction, coarse level: the lane's execution state derived from
+    /// records. 0 open operations = idle (None); 1 = suspended (Some);
+    /// more = corruption from a state a single writer cannot produce.
+    pub fn open_run(&self, session_id: &str) -> Result<Option<OpenRun>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM records
+             WHERE session_id = ?1 AND kind = 'operation_started'
+               AND id NOT IN (
+                   SELECT run_id FROM records
+                   WHERE session_id = ?1 AND kind = 'operation_finished')
+             ORDER BY seq LIMIT 3",
+        )?;
+        let open: Vec<String> = stmt
+            .query_map(params![session_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        match open.len() {
+            0 => Ok(None),
+            1 => {
+                let run_id = &open[0];
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, run_id, seq, kind, payload FROM records
+                     WHERE session_id = ?1 AND run_id = ?2 ORDER BY seq",
+                )?;
+                let records: Vec<Record> = stmt
+                    .query_map(params![session_id, run_id], |row| {
+                        Ok(Record {
+                            id: row.get(0)?,
+                            run_id: row.get(1)?,
+                            seq: row.get(2)?,
+                            kind: row.get(3)?,
+                            payload: serde_json::from_str(&row.get::<_, String>(4)?)
+                                .unwrap_or(Value::Null),
+                        })
+                    })?
+                    .collect::<Result<_, _>>()?;
+                let source_leaf_id = records
+                    .first()
+                    .and_then(|r| r.payload.get("source_leaf_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Ok(Some(OpenRun {
+                    run_id: run_id.clone(),
+                    source_leaf_id,
+                    records,
+                }))
+            }
+            n => Err(StoreError::Corrupt(format!(
+                "{n}+ open operations on one lane — impossible for a single writer"
+            ))),
+        }
+    }
+}
+
+/// Allocate the next per-session sequence number inside the caller's
+/// transaction. Callers never read, reserve, or increment sequences.
+fn next_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64, StoreError> {
+    let seq: i64 = tx.query_row(
+        "UPDATE sessions SET next_seq = next_seq + 1 WHERE id = ?1 RETURNING next_seq - 1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    Ok(seq)
+}
+
+/// v2 → v3: turn each session's flat message list into an entry chain and
+/// point the lane leaf at the last one.
+fn migrate_messages_to_entries(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let sessions: Vec<String> = tx
+        .prepare("SELECT id FROM sessions")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    for session_id in sessions {
+        let rows: Vec<(String, String)> = tx
+            .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY idx")?
+            .query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+
+        let mut parent: Option<String> = None;
+        for (role, content) in rows {
+            let payload = serde_json::json!({
+                "role": if role == "user" { "user" } else { "assistant" },
+                "content": serde_json::from_str::<Value>(&content)?,
+            });
+            let id = uuid::Uuid::new_v4().to_string();
+            let seq = next_seq(tx, &session_id)?;
+            tx.execute(
+                "INSERT INTO entries (id, session_id, parent_id, seq, kind, payload)
+                 VALUES (?1, ?2, ?3, ?4, 'message', ?5)",
+                params![id, session_id, parent, seq, payload.to_string()],
+            )?;
+            parent = Some(id);
+        }
+        tx.execute(
+            "INSERT INTO lanes (session_id, name, leaf_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (session_id, name) DO UPDATE SET leaf_id = excluded.leaf_id",
+            params![session_id, MAIN_LANE, parent],
+        )?;
+    }
+    Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -259,9 +573,19 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
+/// Extract a display title from the first user message on the path.
+pub fn title_from(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .map(|m| m.text().chars().take(80).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bullpen_llm::ContentBlock;
     use serde_json::json;
 
     fn store() -> (tempfile::TempDir, Store) {
@@ -270,98 +594,137 @@ mod tests {
         (dir, store)
     }
 
-    fn sample_messages() -> Vec<Message> {
-        vec![
-            Message::user_text("fix the bug"),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Text { text: "on it".into() },
-                    ContentBlock::ToolUse {
-                        id: "tu_1".into(),
-                        name: "bash".into(),
-                        input: json!({"command": "ls"}),
-                    },
-                ],
-            },
-            Message::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: "tu_1".into(),
-                content: "main.rs".into(),
-                is_error: false,
-            }]),
-        ]
+    fn msg_payload(m: &Message) -> Value {
+        serde_json::to_value(m).unwrap()
     }
 
     #[test]
-    fn transcript_roundtrip_preserves_blocks() {
+    fn entry_chain_roundtrip() {
         let (_dir, mut store) = store();
-        let session = store.create_session("/tmp", "anthropic", "claude-sonnet-5").unwrap();
-        let messages = sample_messages();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+
+        let m1 = Message::user_text("hello");
+        let m2 = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        };
+        store.append_entry(&s.id, "e1", "message", &msg_payload(&m1)).unwrap();
+        store.append_entry(&s.id, "e2", "message", &msg_payload(&m2)).unwrap();
+
+        assert_eq!(store.leaf(&s.id).unwrap().as_deref(), Some("e2"));
+        let messages = store.path_messages(&s.id).unwrap();
+        assert_eq!(messages, vec![m1, m2]);
+    }
+
+    #[test]
+    fn provisioned_append_is_idempotent() {
+        let (_dir, mut store) = store();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+        let payload = msg_payload(&Message::user_text("once"));
+        store.append_entry(&s.id, "e1", "message", &payload).unwrap();
+        store.append_entry(&s.id, "e1", "message", &payload).unwrap();
+        assert_eq!(store.path(&s.id).unwrap().len(), 1);
+
         store
-            .save_transcript(
-                &session.id,
-                &messages,
-                Usage { input_tokens: 100, output_tokens: 50 },
+            .append_record(&s.id, "r1", "run", "step_attempt", &json!({"n": 1}))
+            .unwrap();
+        store
+            .append_record(&s.id, "r1", "run", "step_attempt", &json!({"n": 1}))
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn operation_lifecycle_and_reduction() {
+        let (_dir, mut store) = store();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+        assert!(store.open_run(&s.id).unwrap().is_none());
+
+        let run = store.start_operation(&s.id, &json!({"prompt": "go"})).unwrap();
+        let open = store.open_run(&s.id).unwrap().expect("suspended");
+        assert_eq!(open.run_id, run);
+        assert_eq!(open.records.len(), 1);
+
+        // A second start while open is refused, not silently allowed.
+        assert!(matches!(
+            store.start_operation(&s.id, &json!({})),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        store.finish_operation(&s.id, &run, "completed").unwrap();
+        assert!(store.open_run(&s.id).unwrap().is_none());
+        // Finishing again is idempotent.
+        store.finish_operation(&s.id, &run, "completed").unwrap();
+    }
+
+    #[test]
+    fn seq_is_shared_and_monotonic_across_tables() {
+        let (_dir, mut store) = store();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+        store
+            .append_entry(&s.id, "e1", "message", &msg_payload(&Message::user_text("a")))
+            .unwrap();
+        let run = store.start_operation(&s.id, &json!({})).unwrap();
+        store
+            .append_entry(&s.id, "e2", "message", &msg_payload(&Message::user_text("b")))
+            .unwrap();
+
+        let entry_seqs: Vec<i64> = store.path(&s.id).unwrap().iter().map(|e| e.seq).collect();
+        let record_seq = store.open_run(&s.id).unwrap().unwrap().records[0].seq;
+        assert_eq!(entry_seqs, vec![1, 3]);
+        assert_eq!(record_seq, 2);
+        store.finish_operation(&s.id, &run, "completed").unwrap();
+    }
+
+    #[test]
+    fn migrates_v2_sessions_into_entry_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        // Build a v2 database by hand.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic'
+                 );
+                 CREATE TABLE messages (
+                    session_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                    role TEXT NOT NULL, content TEXT NOT NULL,
+                    PRIMARY KEY (session_id, idx)
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 PRAGMA user_version = 2;",
             )
             .unwrap();
-
-        let loaded = store.load_transcript(&session.id).unwrap();
-        assert_eq!(loaded, messages);
-
-        let session = store.get_session(&session.id).unwrap();
-        assert_eq!(session.usage.input_tokens, 100);
-        assert_eq!(session.title, "fix the bug");
-    }
-
-    #[test]
-    fn resave_replaces_not_duplicates() {
-        let (_dir, mut store) = store();
-        let session = store.create_session("/tmp", "anthropic", "m").unwrap();
-        let mut messages = sample_messages();
-        store
-            .save_transcript(&session.id, &messages, Usage::default())
+            let content =
+                serde_json::to_string(&vec![ContentBlock::Text { text: "hi".into() }]).unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, idx, role, content) VALUES ('s1', 0, 'user', ?1)",
+                params![content],
+            )
             .unwrap();
-        messages.push(Message::user_text("and another thing"));
-        store
-            .save_transcript(&session.id, &messages, Usage::default())
+            conn.execute(
+                "INSERT INTO messages (session_id, idx, role, content) VALUES ('s1', 1, 'assistant', ?1)",
+                params![content],
+            )
             .unwrap();
-        assert_eq!(store.load_transcript(&session.id).unwrap().len(), 4);
-    }
+        }
 
-    #[test]
-    fn prefix_resolution() {
-        let (_dir, store) = store();
-        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
-        let found = store.resolve_session(&s.id[..8]).unwrap();
-        assert_eq!(found.id, s.id);
-        assert!(matches!(
-            store.resolve_session("zzzz"),
-            Err(StoreError::NotFound(_))
-        ));
-    }
-
-    #[test]
-    fn save_to_unknown_session_fails() {
-        let (_dir, mut store) = store();
-        let err = store
-            .save_transcript("nope", &sample_messages(), Usage::default())
-            .unwrap_err();
-        assert!(matches!(err, StoreError::NotFound(_)));
-    }
-
-    #[test]
-    fn two_connections_share_the_store() {
-        // The WAL claim in miniature: a second connection opened on the same
-        // file sees the first one's committed writes.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shared.db");
-        let mut a = Store::open(&path).unwrap();
-        let b = Store::open(&path).unwrap();
-
-        let s = a.create_session("/tmp", "anthropic", "m").unwrap();
-        a.save_transcript(&s.id, &sample_messages(), Usage::default())
-            .unwrap();
-        assert_eq!(b.list_sessions().unwrap().len(), 1);
-        assert_eq!(b.load_transcript(&s.id).unwrap().len(), 3);
+        let store = Store::open(&path).unwrap();
+        let messages = store.path_messages("s1").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert!(store.open_run("s1").unwrap().is_none());
     }
 }

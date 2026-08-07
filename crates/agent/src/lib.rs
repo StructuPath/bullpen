@@ -13,6 +13,10 @@
 //!   separately, so the transcript is always structurally valid for the next
 //!   provider call.
 
+mod journal;
+
+pub use journal::{Journal, JournalError, NullJournal, RunOutcome, ToolIntent};
+
 use std::sync::Arc;
 
 use bullpen_llm::{
@@ -75,6 +79,8 @@ pub enum AgentError {
     Truncated { partial: String },
     #[error("exceeded {0} provider turns (runaway fuse)")]
     MaxTurns(u32),
+    #[error(transparent)]
+    Journal(#[from] JournalError),
 }
 
 pub struct Agent {
@@ -85,6 +91,7 @@ pub struct Agent {
     messages: Vec<Message>,
     usage: Usage,
     events: Option<UnboundedSender<Event>>,
+    journal: Box<dyn Journal>,
 }
 
 impl Agent {
@@ -102,7 +109,14 @@ impl Agent {
             messages: Vec::new(),
             usage: Usage::default(),
             events: None,
+            journal: Box::new(NullJournal),
         }
+    }
+
+    /// Attach a durability journal. Without one, execution is in-memory only.
+    pub fn with_journal(mut self, journal: Box<dyn Journal>) -> Self {
+        self.journal = journal;
+        self
     }
 
     /// Restore a transcript (resume). The caller is responsible for handing
@@ -136,10 +150,33 @@ impl Agent {
     /// Run one full turn: append the user text, then alternate provider calls
     /// and tool execution until the provider ends its turn. Returns the final
     /// assistant text.
+    ///
+    /// Durability protocol (see [`Journal`]): the run start, every assistant
+    /// message, and every tool intent are journaled *before* the next effect
+    /// runs. On error paths `run_finished(Failed)` is attempted best-effort —
+    /// if that final write also fails, the operation simply stays open and
+    /// recovery closes it.
     pub async fn send(&mut self, text: impl Into<String>) -> Result<String, AgentError> {
-        self.messages.push(Message::user_text(text));
+        let user = Message::user_text(text);
+        self.journal.run_started(&user).await?;
+        self.messages.push(user);
 
-        for _ in 0..self.config.max_turns {
+        match self.drive().await {
+            Ok(answer) => Ok(answer),
+            Err(e) => {
+                let outcome = match &e {
+                    AgentError::Truncated { .. } => RunOutcome::Truncated,
+                    _ => RunOutcome::Failed,
+                };
+                let _ = self.journal.run_finished(outcome, self.usage).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn drive(&mut self) -> Result<String, AgentError> {
+        for attempt in 1..=self.config.max_turns {
+            self.journal.step_attempt(attempt).await?;
             let request = Request {
                 model: self.config.model.clone(),
                 system: self.config.system.clone(),
@@ -166,53 +203,76 @@ impl Agent {
                 });
             }
 
-            let tool_uses: Vec<(String, String, serde_json::Value)> = response
-                .tool_uses()
-                .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
+            let assistant = Message {
+                role: Role::Assistant,
+                content: response.content,
+            };
+            self.journal.assistant_message(&assistant).await?;
+
+            let intents: Vec<ToolIntent> = assistant
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, name, input } => Some(ToolIntent {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        replay_safe: self
+                            .registry
+                            .get(name)
+                            .is_some_and(|t| t.replay_safe()),
+                    }),
+                    _ => None,
+                })
                 .collect();
 
-            if tool_uses.is_empty() {
-                self.messages.push(Message {
-                    role: Role::Assistant,
-                    content: response.content,
-                });
+            if intents.is_empty() {
+                self.messages.push(assistant);
                 self.emit(Event::TurnDone { usage: self.usage });
                 return match response.stop_reason {
                     StopReason::MaxTokens => Err(AgentError::Truncated {
                         partial: assistant_text,
                     }),
-                    _ => Ok(assistant_text),
+                    _ => {
+                        self.journal
+                            .run_finished(RunOutcome::Completed, self.usage)
+                            .await?;
+                        Ok(assistant_text)
+                    }
                 };
             }
 
+            // Intents become durable before any tool effect starts.
+            self.journal.tool_batch(&intents).await?;
+
             // Execute every requested tool and build results in request order
-            // BEFORE committing anything to the transcript.
-            let mut results = Vec::with_capacity(tool_uses.len());
-            for (id, name, input) in &tool_uses {
+            // BEFORE committing anything to the in-memory transcript.
+            let mut results = Vec::with_capacity(intents.len());
+            for intent in &intents {
                 self.emit(Event::ToolStart {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
+                    id: intent.tool_use_id.clone(),
+                    name: intent.name.clone(),
+                    input: intent.input.clone(),
                 });
-                let (output, is_error) = self.run_tool(name, input.clone()).await;
+                let (output, is_error) =
+                    self.run_tool(&intent.name, intent.input.clone()).await;
                 self.emit(Event::ToolEnd {
-                    id: id.clone(),
-                    name: name.clone(),
+                    id: intent.tool_use_id.clone(),
+                    name: intent.name.clone(),
                     output: output.clone(),
                     is_error,
                 });
                 results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
+                    tool_use_id: intent.tool_use_id.clone(),
                     content: cap_result(output),
                     is_error,
                 });
             }
 
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: response.content,
-            });
-            self.messages.push(Message::tool_results(results));
+            let results = Message::tool_results(results);
+            self.journal.tool_results(&results).await?;
+            self.messages.push(assistant);
+            self.messages.push(results);
         }
 
         Err(AgentError::MaxTurns(self.config.max_turns))
@@ -446,6 +506,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Records the journal protocol calls in order.
+    #[derive(Clone, Default)]
+    struct RecordingJournal(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl Journal for RecordingJournal {
+        async fn run_started(&mut self, _: &Message) -> Result<(), JournalError> {
+            self.0.lock().unwrap().push("run_started".into());
+            Ok(())
+        }
+        async fn step_attempt(&mut self, n: u32) -> Result<(), JournalError> {
+            self.0.lock().unwrap().push(format!("step:{n}"));
+            Ok(())
+        }
+        async fn assistant_message(&mut self, _: &Message) -> Result<(), JournalError> {
+            self.0.lock().unwrap().push("assistant".into());
+            Ok(())
+        }
+        async fn tool_batch(&mut self, intents: &[ToolIntent]) -> Result<(), JournalError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("intents:{}", intents.len()));
+            Ok(())
+        }
+        async fn tool_results(&mut self, _: &Message) -> Result<(), JournalError> {
+            self.0.lock().unwrap().push("results".into());
+            Ok(())
+        }
+        async fn run_finished(&mut self, outcome: RunOutcome, _: Usage) -> Result<(), JournalError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("finished:{}", outcome.as_str()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_sees_protocol_in_intent_order() {
+        let provider = FakeProvider::new(vec![
+            tool_response("tu_1", "echo", json!({"value": 1})),
+            text_response("done", StopReason::EndTurn),
+        ]);
+        let recorder = RecordingJournal::default();
+        let calls = recorder.0.clone();
+        let mut agent = agent(provider).with_journal(Box::new(recorder));
+        agent.send("go").await.unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "run_started",
+                "step:1",
+                "assistant",
+                "intents:1",
+                "results",
+                "step:2",
+                "assistant",
+                "finished:completed",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_failure_faults_the_run() {
+        struct FailingJournal;
+        #[async_trait::async_trait]
+        impl Journal for FailingJournal {
+            async fn run_started(&mut self, _: &Message) -> Result<(), JournalError> {
+                Err(JournalError("disk full".into()))
+            }
+            async fn step_attempt(&mut self, _: u32) -> Result<(), JournalError> {
+                Ok(())
+            }
+            async fn assistant_message(&mut self, _: &Message) -> Result<(), JournalError> {
+                Ok(())
+            }
+            async fn tool_batch(&mut self, _: &[ToolIntent]) -> Result<(), JournalError> {
+                Ok(())
+            }
+            async fn tool_results(&mut self, _: &Message) -> Result<(), JournalError> {
+                Ok(())
+            }
+            async fn run_finished(&mut self, _: RunOutcome, _: Usage) -> Result<(), JournalError> {
+                Ok(())
+            }
+        }
+
+        let provider = FakeProvider::new(vec![text_response("hi", StopReason::EndTurn)]);
+        let mut agent = agent(provider).with_journal(Box::new(FailingJournal));
+        let err = agent.send("go").await.unwrap_err();
+        assert!(matches!(err, AgentError::Journal(_)));
     }
 
     #[tokio::test]

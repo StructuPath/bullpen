@@ -134,6 +134,7 @@ dependencies = [
  "anyhow",
  "bullpen-agent",
  "bullpen-auth",
+ "bullpen-harness",
  "bullpen-llm",
  "bullpen-store",
  "bullpen-tools",
@@ -176,6 +177,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bullpen-harness"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bullpen-agent",
+ "bullpen-llm",
+ "bullpen-store",
+ "bullpen-tools",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bullpen-llm"
 version = "0.1.0"
 dependencies = [
@@ -194,6 +210,7 @@ version = "0.1.0"
 dependencies = [
  "bullpen-llm",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

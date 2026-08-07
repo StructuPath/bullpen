@@ -31,7 +31,8 @@ crates above it in this table:
 | `bullpen-auth` | Credential store (`~/.bullpen/auth.json`, 0600, atomic), PKCE, OpenRouter OAuth, Codex device-code flow + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
 | `bullpen-tools` | `Tool` trait, `Registry`, built-ins (bash, read/write/edit, grep, glob), parallel-safety flags | Providers, the loop |
 | `bullpen-store` | SQLite persistence: sessions, transcripts, usage; schema migrations via `user_version` | Providers, tools, the loop |
-| `bullpen-agent` | The loop: transcript, provider calls, tool continuation, events, max-turns fuse | Config files, sessions, vendors, UI |
+| `bullpen-agent` | The loop: transcript, provider calls, tool continuation, events, max-turns fuse, the `Journal` durability protocol (trait only) | Config files, sessions, vendors, UI, storage |
+| `bullpen-harness` | Durable execution: `StoreJournal` (implements `Journal` over the store), crash recovery orchestration; future home of the pen | Vendors, UI |
 | `bullpen` (cli) | Composition root: wiring, system prompt, headless `run`, `sessions` | — (the only crate that knows everything) |
 
 The rule inherited from neo, kept absolute: **the core loop is policy-free.**
@@ -92,13 +93,94 @@ an optional channel. Rendering lives entirely outside the loop — the headless
 CLI prints them; the future TUI consumes the same stream. A gone subscriber
 never stops the loop.
 
-## Persistence
+## Persistence and durable execution
 
-One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set,
-schema versioned by `pragma user_version`. Transcript saves are
-transactional replace-all; the CLI saves after every turn **including failed
-ones**, so a session is always resumable. Session ids resolve by unique
-prefix.
+One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
+versioned by `pragma user_version`. Session ids resolve by unique prefix.
+
+The durable-execution design below is adapted from pi's `harness-v2.md`
+design spec (earendil-works/pi, `packages/agent/docs/`), simplified to
+bullpen's current scope. Credit where due: the durability rule, reduction
+idea, and recovery discipline are theirs; the Rust realization and the
+narrower cut are ours. Note harness-v2 is a spec pi has only partially
+implemented — bullpen is a first production test of these ideas, so each
+piece gets verified here, not assumed.
+
+### Two kinds of state
+
+**Entries** are the conversation: an append-only tree per session
+(`id`/`parent_id`), where each session lane has a leaf pointer. Entries are
+what the model sees; rebuilding provider context walks leaf → root. The
+tree never contains orchestration state.
+
+**Records** are execution: a flat per-session log (`operation_started`,
+`step_attempt`, `tool_started`, `operation_finished`) that nothing reads
+during normal execution. Records never enter model context. Deleting every
+record leaves a complete, valid conversation.
+
+Both share one per-session monotonic `seq`, allocated inside the storage
+write — callers never see or pass sequence numbers or parent ids.
+
+### The durability rule
+
+> Before an effect: write an intent record naming what will happen and the
+> ids it will produce. After the effect: append the result as an entry with
+> exactly those ids.
+
+There is **no multi-row atomicity and none is needed** — every record and
+entry is durable alone. An intent is fulfilled iff an entry with its
+provisioned id exists. Appends are idempotent (`append-if-missing` on the
+provisioned id), so re-running recovery is always safe.
+
+The run protocol, as the `Journal` trait in `bullpen-agent`:
+
+```text
+run_started        op record + user entry
+  step_attempt     durable attempt counter (a crash-restart loop cannot reset it)
+  assistant_message  entry
+  tool_batch       one intent record per call, all sharing one provisioned
+                   results-entry id + a snapshot of each tool's replay safety
+  tool_results     the provisioned grouped results entry
+run_finished       op record (completed | failed | truncated | aborted)
+```
+
+A journal write failure fails the run — durability is not best-effort.
+Results are grouped in one entry per batch (matching the in-memory message
+shape); the cost is that a crash mid-batch loses the whole batch's results
+to synthesis. Acceptable at serial tool execution; revisit with parallel
+scheduling.
+
+### Reduction and recovery
+
+A session's execution state is **defined** as the reduction of its records:
+no open `operation_started` → idle; exactly one → suspended; two or more →
+corruption (single-writer states only; the reducer rejects, never repairs).
+
+Recovery (run automatically before using a session with an open operation)
+reads the open run's records and the entry path back to the run's source
+leaf, then: appends synthetic `interrupted` tool results for unfulfilled
+intents (grouped entry, provisioned id), appends a closing assistant entry
+if the leaf would otherwise end on a user message, writes
+`operation_finished(aborted)`, and clears the lane's open-operation marker.
+Conservative v1 choice: replay-safe tools are *not* re-executed on
+recovery; everything unfulfilled synthesizes as interrupted. The
+declaration is snapshotted in the intent record now so re-execution can be
+added without a schema change.
+
+### Rules carried forward (from harness-v2, enforced here as we grow)
+
+- **Append-only context**: provider context only grows at the tail within
+  a lane; inserting earlier silently invalidates provider KV cache.
+  Steering and deferred writes (M2+) must consume at checkpoints, never
+  splice.
+- **Never persist partial provider streams** — retry or abandon.
+- **Deterministic child ids** for the pen: a subagent's session id derives
+  from `f(parent_session, tool_call_id)`, so a replayed spawn reattaches
+  instead of spawning a twin.
+- **Lanes**: schema carries a lane name (default `main`) from day one;
+  multi-lane execution arrives with the pen.
+- Usage stays a side channel (session totals today, a ledger later);
+  reduction and recovery never read it.
 
 ## Roadmap
 
@@ -112,11 +194,12 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   adapter; cache-control breakpoints on the system block. Event stream grows
   text deltas. (The Codex adapter already consumes SSE but buffers it;
   incremental deltas land here too.)
-- **M2 — The pen (durable subagents).** `pen` crate: supervisor with budgets
-  (count, wall-clock, tokens), each child a fresh `Agent` persisted as an
-  `agent_runs` row + own transcript. Children survive process exit and are
-  resumable/attachable. `agent` tool exposed to the coordinator. Parallel
-  scheduling of read-only children.
+- **M2 — The pen (durable subagents).** Foundation (store v3: entry tree,
+  records, reduction, recovery — see "Persistence and durable execution")
+  landed 2026-08-07. Next: supervisor with budgets (count, wall-clock,
+  tokens), children as forked sessions with deterministic ids, resumable
+  and attachable across process exits, `agent` tool for the coordinator,
+  parallel scheduling of read-only children.
 - **M3 — Sandbox + permissions.** `sandbox` crate: capability grants (fs
   read/write path sets, network, process spawn) resolved per tool call;
   Seatbelt profile generation on macOS, Landlock on Linux. Approvals become
