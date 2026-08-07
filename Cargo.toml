@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/llm",
+    "crates/tools",
+    "crates/agent",
+    "crates/store",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/StructuPath/bullpen"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "signal", "io-util"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+bullpen-llm = { path = "crates/llm" }
+bullpen-tools = { path = "crates/tools" }
+bullpen-agent = { path = "crates/agent" }
+bullpen-store = { path = "crates/store" }
+
+[profile.release]
+lto = "thin"
+strip = true
