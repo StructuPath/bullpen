@@ -6,11 +6,12 @@
 
 mod agents;
 mod bg;
+mod json;
 
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use bullpen_agent::{Agent, AgentConfig, Event};
+use bullpen_agent::{Agent, AgentConfig, AgentError, Event};
 use bullpen_auth::codex::{CodexAuth, CodexCliBorrow, StoredCodex};
 use bullpen_auth::{AuthFile, Credential, openrouter, pkce::Pkce};
 use bullpen_llm::Provider;
@@ -49,6 +50,9 @@ enum Command {
         /// Show tool activity on stderr while running.
         #[arg(short, long)]
         verbose: bool,
+        /// Stream the run as newline-delimited JSON on stdout.
+        #[arg(long)]
+        json: bool,
         /// Confine writes to the workspace (and system temp). On macOS this
         /// also runs shell commands under Seatbelt; elsewhere only the file
         /// tools are confined (see --sandbox notes).
@@ -175,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             resume,
             verbose,
+            json,
             sandbox,
             sandbox_strict,
             bg,
@@ -185,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 resume,
                 verbose,
+                json,
                 sandbox,
                 sandbox_strict,
                 bg,
@@ -329,6 +335,7 @@ async fn run(
     model: Option<String>,
     resume: Option<String>,
     verbose: bool,
+    json: bool,
     sandbox: bool,
     sandbox_strict: bool,
     bg: bool,
@@ -354,7 +361,11 @@ async fn run(
         }
         let pid = bg::spawn_detached(&session.id, &prompt, &extra)?;
         store.set_run_status(&session.id, "running", Some(pid as i64))?;
-        println!("dispatched {} (pid {pid})", &session.id[..8]);
+        if json {
+            json::emit(&json::dispatched_json(&session.id, pid));
+        } else {
+            println!("dispatched {} (pid {pid})", &session.id[..8]);
+        }
         eprintln!(
             "  bullpen agents            watch it\n  bullpen logs {}          tail its output\n  bullpen run -r {} \"...\"   continue it",
             &session.id[..8],
@@ -422,6 +433,11 @@ async fn run(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
+            // One task owns stdout under --json, so event order is the order
+            // the loop produced them in.
+            if json {
+                json::emit(&json::event_json(&event));
+            }
             if !verbose {
                 continue;
             }
@@ -442,6 +458,11 @@ async fn run(
         use std::io::Write;
         let mut out = std::io::stdout();
         while let Some(text) = delta_rx.recv().await {
+            // The sink stays attached under --json so the agent still takes
+            // its streaming path; only the raw text is dropped.
+            if json {
+                continue;
+            }
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
         }
@@ -498,10 +519,29 @@ async fn run(
         let _ = store.set_run_status(&session.id, final_status, None);
     }
 
+    // Both consumer tasks have joined, so this is provably the last line of
+    // the stream. It carries the outcome outright: a consumer must never have
+    // to infer completion from stdout closing.
+    if json {
+        let (text, error) = match &result {
+            Ok(text) => (text.as_str(), None),
+            Err(e @ AgentError::Truncated { partial }) => (partial.as_str(), Some(e.to_string())),
+            Err(e) => ("", Some(e.to_string())),
+        };
+        json::emit(&json::result_json(
+            &session.id,
+            text,
+            usage,
+            error.as_deref(),
+        ));
+    }
+
     match result {
         Ok(_) => {
             // The answer already streamed to stdout; just close the line.
-            println!();
+            if !json {
+                println!();
+            }
             eprintln!(
                 "[session {} · {} · {} in / {} out tokens]",
                 &session.id[..8],
@@ -512,7 +552,9 @@ async fn run(
             Ok(())
         }
         Err(e) => {
-            println!();
+            if !json {
+                println!();
+            }
             bail!("agent error (session {} saved): {e}", &session.id[..8])
         }
     }

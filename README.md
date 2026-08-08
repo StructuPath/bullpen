@@ -67,6 +67,7 @@ cd your-project
 bullpen run "find the failing test and explain why it fails"
 bullpen run --sandbox "refactor the retry logic"     # confine writes
 bullpen run -v "..."                                 # tool activity on stderr
+bullpen run --json "..."                             # NDJSON event stream on stdout
 ```
 
 Sessions are resumable by id prefix, with the provider they were created
