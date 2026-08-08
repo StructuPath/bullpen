@@ -9,16 +9,18 @@ A durable agent harness in Rust. The name is the thesis: a bullpen is a roster
 of warmed-up relievers you can call in, pull back, and send out again — agents
 as managed, durable workers rather than fire-and-forget processes.
 
-Bullpen deliberately adopts the best structural idea from
-[neo](https://github.com/owainlewis/neo): a **policy-free core loop** composed
-at the edge. It deliberately rejects neo's three biggest limitations, which are
-bullpen's differentiators:
+Three commitments follow from that, and they are what bullpen is for. Each
+is a place where the common harness design gives up something bullpen
+refuses to:
 
-| # | neo limitation | bullpen answer |
+| | Commitment | What it rules out |
 |---|---|---|
-| 1 | Sessions/subagent state die with the process; JSON stores lose concurrent writes | One SQLite database (WAL) for all state: sessions, agent runs, workflow steps. Cross-process safe, resumable by design |
-| 2 | No sandbox; approvals are "friction, not authorization" | OS-level sandboxing (Seatbelt on macOS, Landlock on Linux) with a real capability model resolved per tool call |
-| 3 | Workflow checklist is UI state only | A durable workflow engine: steps persisted, resumable, deterministic orchestration over agents |
+| 1 | **One durable store.** A single SQLite database (WAL) holds every session, agent run, and workflow step — cross-process safe, resumable by design | State that dies with the process, and JSON files that lose concurrent writes |
+| 2 | **Real confinement.** OS-level sandboxing (Seatbelt on macOS, Landlock intended on Linux) with a capability model resolved per tool call | Approval prompts as the only boundary — friction, not authorization |
+| 3 | **Durable orchestration.** Workflow steps persisted and resumable from any point, not held in a UI | A checklist that exists only while something is watching it |
+
+The core loop stays **policy-free**: `bullpen-agent` knows nothing about
+vendors, config, or UI. Everything else composes around it at the edge.
 
 ## Crate map
 
@@ -35,10 +37,12 @@ crates above it in this table:
 | `bullpen-harness` | Durable execution: `StoreJournal` (implements `Journal` over the store), crash recovery orchestration; future home of the pen | Vendors, UI |
 | `bullpen` (cli) | Composition root: wiring, system prompt, headless `run`, `sessions` | — (the only crate that knows everything) |
 
-The rule inherited from neo, kept absolute: **the core loop is policy-free.**
-Product capabilities (skills, project context, phases, the pen, workflows,
-TUI) compose around `bullpen-agent` through interfaces and events. If a
-feature needs the loop changed, that's a design smell to justify explicitly.
+The rule that makes the table above enforceable, kept absolute: **the core
+loop is policy-free.** Product capabilities (skills, project context, phases,
+the pen, workflows, TUI) compose around `bullpen-agent` through interfaces
+and events. If a feature needs the loop changed, that's a design smell to
+justify explicitly. See [Prior art](#prior-art) for where the principle
+comes from.
 
 ## Providers and auth
 
@@ -98,13 +102,11 @@ never stops the loop.
 One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
 versioned by `pragma user_version`. Session ids resolve by unique prefix.
 
-The durable-execution design below is adapted from pi's `harness-v2.md`
-design spec (earendil-works/pi, `packages/agent/docs/`), simplified to
-bullpen's current scope. Credit where due: the durability rule, reduction
-idea, and recovery discipline are theirs; the Rust realization and the
-narrower cut are ours. Note harness-v2 is a spec pi has only partially
-implemented — bullpen is a first production test of these ideas, so each
-piece gets verified here, not assumed.
+The durability rule, the reduction idea, and the recovery discipline below
+are adapted from pi's `harness-v2.md` design spec — see
+[Prior art](#prior-art). That spec is only partially implemented upstream,
+so bullpen is a first production test of these ideas: every piece is
+verified here rather than assumed.
 
 ### Two kinds of state
 
@@ -267,10 +269,41 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   transcript/tool-card/pen-tree view over the event stream.
 - **M5 — Workflow engine.** Durable steps in SQLite; deterministic
   orchestration (sequence/fan-out/join) over pen agents; resume from any
-  step. This is the layer neo has only as UI state.
+  step — the third commitment at the top of this document, made real.
 - **Ongoing.** Compaction (M1.5, before long sessions hurt); project
   context discovery (AGENTS.md); skills; second provider adapter when
   genuinely needed, not before.
+
+## Prior art
+
+bullpen did not invent its core loop shape or its durability protocol, and
+this section records where they came from. Both projects are MIT-licensed;
+what bullpen took from each is design, not code.
+
+**[neo](https://github.com/owainlewis/neo)** — the **policy-free core loop**
+composed at the edge. That single principle shapes the crate map above: it is
+why `bullpen-agent` is forbidden from knowing about vendors, config, or
+storage, and why every product capability attaches through interfaces and
+events instead of by editing the loop. neo's Codex implementation was also
+the reference used to confirm two wire-contract quirks — the terminal
+`response.completed` event omitting `output`, and encrypted `reasoning` items
+needing verbatim replay — and the shape of the public Codex CLI device-code
+flow. Those are observations about a third-party protocol, verified
+independently against live traffic here.
+
+**[pi](https://github.com/earendil-works/pi)** — the `harness-v2.md` design
+spec (`packages/agent/docs/`) behind [durable
+execution](#persistence-and-durable-execution): the durability rule
+(intent record before the effect, entry after it), the reduction idea, and
+the recovery discipline. The Rust realization, the entry/record split as
+implemented, and the deliberately narrower v0 cut are bullpen's. Because
+harness-v2 is only partially implemented upstream, bullpen treats it as a
+hypothesis under test rather than a proven design.
+
+Where bullpen diverges from both is the subject of the three commitments at
+the top of this document: durable state as the default rather than an
+add-on, OS-level confinement rather than approval prompts, and orchestration
+that survives the UI.
 
 ## Resource bounds (v0)
 
@@ -286,8 +319,14 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
 
 ## Security posture (v0 — honest version)
 
-Until M3 lands, bullpen has the same posture as neo: tools run with the
-process's full authority; run it somewhere you trust the model to act.
-The difference is intent — sandboxing is a roadmap differentiator here, not a
-documented non-goal. Do not point v0 at anything you wouldn't hand to a
+With `--sandbox` (M3, landed 2026-08-07), writes are confined to the
+workspace on every platform, and on macOS shell commands and their children
+run under Seatbelt. `--sandbox-strict` also denies network. That boundary is
+write-confinement, not a jail: reads stay broad, because toolchains
+legitimately read across the system.
+
+**Without** `--sandbox`, tools run with the process's full authority — and
+that is still the default. Linux has no out-of-process confinement yet
+(Landlock is the intended mechanism; the in-process write check already
+works there). Do not point v0 at anything you wouldn't hand to a
 contractor's laptop.
