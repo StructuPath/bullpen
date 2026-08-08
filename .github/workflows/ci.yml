@@ -45,6 +45,22 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install --no-self-update
+
+      # No rust-cache: rustfmt parses sources and never builds, so there is
+      # nothing to restore and the cache round-trip would cost more than the job.
+      - name: Format
+        run: cargo fmt --all --check
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
