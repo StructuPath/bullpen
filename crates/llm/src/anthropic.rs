@@ -19,10 +19,32 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
+// GLM (Z.ai) and Kimi (Moonshot) both expose Anthropic-compatible Messages
+// endpoints, so they reuse this adapter's wire conversion entirely — only the
+// endpoint, auth header, and default model differ. These URLs and models are
+// from published docs as of the 2026-01 knowledge cutoff and are NOT verified
+// live here (no keys in the build env); confirm against current provider docs.
+const GLM_URL: &str = "https://api.z.ai/api/anthropic/v1/messages";
+pub const GLM_DEFAULT_MODEL: &str = "glm-4.6";
+const KIMI_URL: &str = "https://api.moonshot.ai/anthropic/v1/messages";
+pub const KIMI_DEFAULT_MODEL: &str = "kimi-k2-0905-preview";
+
+/// How the API key is presented. Anthropic proper uses `x-api-key`;
+/// Moonshot's Anthropic-compatible endpoint uses a bearer token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthStyle {
+    XApiKey,
+    Bearer,
+}
+
 pub struct Anthropic {
     client: reqwest::Client,
+    name: &'static str,
     api_key: String,
     base_url: String,
+    auth: AuthStyle,
+    /// Whether to advertise prompt-cache breakpoints on the wire.
+    caching: bool,
 }
 
 impl Anthropic {
@@ -32,9 +54,33 @@ impl Anthropic {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("reqwest client"),
+            name: "anthropic",
             api_key: api_key.into(),
             base_url: API_URL.to_string(),
+            auth: AuthStyle::XApiKey,
+            caching: true,
         }
+    }
+
+    /// GLM (Z.ai) via its Anthropic-compatible endpoint.
+    pub fn glm(api_key: impl Into<String>) -> Self {
+        let mut p = Self::new(api_key);
+        p.name = "glm";
+        p.base_url = GLM_URL.to_string();
+        // Z.ai's Anthropic endpoint accepts x-api-key; caching semantics are
+        // not guaranteed, so it stays off until confirmed.
+        p.caching = false;
+        p
+    }
+
+    /// Kimi (Moonshot) via its Anthropic-compatible endpoint.
+    pub fn kimi(api_key: impl Into<String>) -> Self {
+        let mut p = Self::new(api_key);
+        p.name = "kimi";
+        p.base_url = KIMI_URL.to_string();
+        p.auth = AuthStyle::Bearer;
+        p.caching = false;
+        p
     }
 
     /// Override the endpoint; used by tests against a local server.
@@ -47,21 +93,22 @@ impl Anthropic {
 #[async_trait::async_trait]
 impl Provider for Anthropic {
     fn name(&self) -> &str {
-        "anthropic"
+        self.name
     }
 
     async fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
-        let body = to_wire(req);
+        let body = to_wire(req, self.caching);
         let mut attempt = 0u32;
         loop {
-            let result = self
+            let mut builder = self
                 .client
                 .post(&self.base_url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", API_VERSION)
-                .json(&body)
-                .send()
-                .await;
+                .header("anthropic-version", API_VERSION);
+            builder = match self.auth {
+                AuthStyle::XApiKey => builder.header("x-api-key", &self.api_key),
+                AuthStyle::Bearer => builder.bearer_auth(&self.api_key),
+            };
+            let result = builder.json(&body).send().await;
 
             let retry_after = |resp: &reqwest::Response| {
                 resp.headers()
@@ -170,7 +217,7 @@ struct WireUsage {
     output_tokens: u64,
 }
 
-fn to_wire(req: &Request) -> Value {
+fn to_wire(req: &Request, caching: bool) -> Value {
     let messages = req
         .messages
         .iter()
@@ -198,7 +245,20 @@ fn to_wire(req: &Request) -> Value {
         messages,
         tools: req.tools.iter().map(tool_to_wire).collect(),
     };
-    serde_json::to_value(&wire).expect("wire request serializes")
+    let mut body = serde_json::to_value(&wire).expect("wire request serializes");
+
+    // Prompt caching: mark the (stable) system prompt as an ephemeral cache
+    // breakpoint. The Anthropic `system` field accepts an array of blocks;
+    // caching the system prompt is the highest-leverage, lowest-risk marker
+    // because it is identical across every turn of a session.
+    if caching && !req.system.is_empty() {
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": req.system,
+            "cache_control": { "type": "ephemeral" }
+        }]);
+    }
+    body
 }
 
 fn block_to_wire(block: &ContentBlock) -> Option<WireBlock> {
@@ -307,7 +367,7 @@ mod tests {
 
     #[test]
     fn request_wire_shape() {
-        let wire = to_wire(&sample_request());
+        let wire = to_wire(&sample_request(), false);
         assert_eq!(wire["model"], "claude-sonnet-5");
         assert_eq!(wire["system"], "be terse");
         assert_eq!(wire["messages"][0]["role"], "user");
@@ -317,6 +377,29 @@ mod tests {
         // is_error: false is elided from the wire
         assert!(wire["messages"][2]["content"][0].get("is_error").is_none());
         assert_eq!(wire["tools"][0]["name"], "bash");
+    }
+
+    #[test]
+    fn caching_marks_system_prompt() {
+        let plain = to_wire(&sample_request(), false);
+        assert_eq!(plain["system"], "be terse");
+
+        let cached = to_wire(&sample_request(), true);
+        assert_eq!(cached["system"][0]["type"], "text");
+        assert_eq!(cached["system"][0]["text"], "be terse");
+        assert_eq!(cached["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn glm_and_kimi_reuse_the_wire() {
+        let glm = Anthropic::glm("k");
+        assert_eq!(glm.name(), "glm");
+        assert_eq!(glm.auth, AuthStyle::XApiKey);
+        let kimi = Anthropic::kimi("k");
+        assert_eq!(kimi.name(), "kimi");
+        assert_eq!(kimi.auth, AuthStyle::Bearer);
+        // Both produce identical wire bodies to Anthropic proper.
+        assert_eq!(to_wire(&sample_request(), false)["messages"].as_array().unwrap().len(), 3);
     }
 
     #[test]

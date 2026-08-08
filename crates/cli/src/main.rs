@@ -11,7 +11,9 @@ use bullpen_agent::{Agent, AgentConfig, Event};
 use bullpen_auth::codex::{CodexAuth, CodexCliBorrow, StoredCodex};
 use bullpen_auth::{AuthFile, Credential, openrouter, pkce::Pkce};
 use bullpen_llm::Provider;
-use bullpen_llm::anthropic::{Anthropic, DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL};
+use bullpen_llm::anthropic::{
+    Anthropic, DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL, GLM_DEFAULT_MODEL, KIMI_DEFAULT_MODEL,
+};
 use bullpen_llm::chatcompletions::{ChatCompletions, OPENROUTER_DEFAULT_MODEL};
 use bullpen_llm::codex::{Codex, DEFAULT_CODEX_MODEL};
 use bullpen_store::Store;
@@ -63,6 +65,8 @@ enum ProviderKind {
     Anthropic,
     Openrouter,
     Codex,
+    Glm,
+    Kimi,
 }
 
 impl ProviderKind {
@@ -71,6 +75,8 @@ impl ProviderKind {
             Self::Anthropic => "anthropic",
             Self::Openrouter => "openrouter",
             Self::Codex => "codex",
+            Self::Glm => "glm",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -79,6 +85,8 @@ impl ProviderKind {
             "anthropic" => Some(Self::Anthropic),
             "openrouter" => Some(Self::Openrouter),
             "codex" => Some(Self::Codex),
+            "glm" => Some(Self::Glm),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -87,6 +95,8 @@ impl ProviderKind {
         match self {
             Self::Anthropic => ANTHROPIC_DEFAULT_MODEL.to_string(),
             Self::Openrouter => OPENROUTER_DEFAULT_MODEL.to_string(),
+            Self::Glm => GLM_DEFAULT_MODEL.to_string(),
+            Self::Kimi => KIMI_DEFAULT_MODEL.to_string(),
             // Prefer the model the user's Codex CLI is configured for — when
             // borrowing its credentials, its model choice is the one known to
             // work with that account.
@@ -188,7 +198,25 @@ fn build_provider(kind: ProviderKind) -> anyhow::Result<Arc<dyn Provider>> {
                  with the Codex CLI so bullpen can borrow its session"
             );
         }
+        ProviderKind::Glm => {
+            let key = env_key(&["GLM_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY"])
+                .context("no GLM key — export GLM_API_KEY (Z.ai coding-plan key)")?;
+            Ok(Arc::new(Anthropic::glm(key)))
+        }
+        ProviderKind::Kimi => {
+            let key = env_key(&["KIMI_API_KEY", "MOONSHOT_API_KEY"])
+                .context("no Kimi key — export KIMI_API_KEY (Moonshot key)")?;
+            Ok(Arc::new(Anthropic::kimi(key)))
+        }
     }
+}
+
+/// First non-empty value among the given environment variable names.
+fn env_key(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .find(|v| !v.is_empty())
 }
 
 // ── Login flows ─────────────────────────────────────────────────────────────
