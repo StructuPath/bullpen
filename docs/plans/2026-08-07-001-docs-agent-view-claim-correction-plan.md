@@ -61,10 +61,10 @@ full Agent View feature list from the same docs.
 - Folding the missing checklist items into M4 as candidates matches intent;
   the alternative reading (wording fix only) loses the checklist value the
   review surfaced.
-- The Claude docs findings are taken from the review as given (persist-on-disk
-  sessions; supervisor for lifecycle/IPC/attach/notify/reconnect). The
-  reviewed page's URL was not captured; if it should be cited in the doc, add
-  it during implementation.
+- The Claude docs findings were verified against the source during
+  implementation, not taken on trust — see Sources. The page confirms
+  persist-on-disk sessions and the supervisor's scope, and names all ten
+  checklist capabilities.
 
 ## Implementation Units
 
@@ -109,5 +109,15 @@ full Agent View feature list from the same docs.
 
 - `ARCHITECTURE.md` M4 bullet — the current inaccurate claim and Stage 2 list.
 - Commit `5e9c7d4` ("Agent view (Stage 1)") — origin of the comparison framing.
-- Review of the current Claude Code Agent View docs (supplied findings:
-  sessions persist on disk; supervisor scope; full feature checklist).
+- [Manage multiple agents with agent view](https://code.claude.com/docs/en/agent-view),
+  read 2026-08-08 — the authority for every claim made about Claude Code here.
+  Confirms "Session state persists on disk through auto-updates and supervisor
+  restarts", stores per-session state in `~/.claude/jobs/<id>/state.json` with
+  `~/.claude/daemon/roster.json` for reconnection, scopes the supervisor to
+  worker pre-warming, per-session directory/credential application,
+  restart-on-exit, idle and memory-pressure eviction, and reconnection across
+  auto-updates, and documents all ten Stage 2 checklist capabilities. Found via
+  the doc index at `https://code.claude.com/llms.txt`, which is the reliable way
+  to re-locate this page if it moves.
+  A third-party product page: re-read it before relying on this comparison, and
+  update the read date when you do.
