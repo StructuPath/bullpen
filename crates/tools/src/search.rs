@@ -142,7 +142,10 @@ impl Tool for Glob {
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
                     continue;
                 }
-                let rel = entry.path().strip_prefix(&workspace).unwrap_or(entry.path());
+                let rel = entry
+                    .path()
+                    .strip_prefix(&workspace)
+                    .unwrap_or(entry.path());
                 if glob.is_match(rel) {
                     hits.push(rel.display().to_string());
                     if hits.len() >= MAX_RESULTS {
@@ -182,7 +185,10 @@ mod tests {
     #[tokio::test]
     async fn grep_finds_matches_with_locations() {
         let (_dir, ctx) = fixture().await;
-        let out = Grep.run(&ctx, "t", json!({"pattern": "steel"})).await.unwrap();
+        let out = Grep
+            .run(&ctx, "t", json!({"pattern": "steel"}))
+            .await
+            .unwrap();
         assert!(out.contains("src/main.rs:2:"), "{out}");
         assert!(out.contains("notes.md:1:"), "{out}");
     }
@@ -190,16 +196,25 @@ mod tests {
     #[tokio::test]
     async fn grep_rejects_bad_regex() {
         let (_dir, ctx) = fixture().await;
-        let err = Grep.run(&ctx, "t", json!({"pattern": "["})).await.unwrap_err();
+        let err = Grep
+            .run(&ctx, "t", json!({"pattern": "["}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
 
     #[tokio::test]
     async fn glob_matches_relative_paths() {
         let (_dir, ctx) = fixture().await;
-        let out = Glob.run(&ctx, "t", json!({"pattern": "**/*.rs"})).await.unwrap();
+        let out = Glob
+            .run(&ctx, "t", json!({"pattern": "**/*.rs"}))
+            .await
+            .unwrap();
         assert_eq!(out, "src/main.rs");
-        let out = Glob.run(&ctx, "t", json!({"pattern": "*.md"})).await.unwrap();
+        let out = Glob
+            .run(&ctx, "t", json!({"pattern": "*.md"}))
+            .await
+            .unwrap();
         assert_eq!(out, "notes.md");
     }
 }

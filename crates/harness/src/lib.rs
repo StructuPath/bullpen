@@ -155,7 +155,11 @@ impl Journal for StoreJournal {
             .map_err(jerr)
     }
 
-    async fn run_finished(&mut self, outcome: RunOutcome, usage: Usage) -> Result<(), JournalError> {
+    async fn run_finished(
+        &mut self,
+        outcome: RunOutcome,
+        usage: Usage,
+    ) -> Result<(), JournalError> {
         let sid = self.session_id.clone();
         let run_id = self.run_id()?.to_string();
         self.store()
@@ -223,7 +227,12 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }
         }
-        async fn run(&self, _: &ToolCtx, _: &str, input: Value) -> Result<String, bullpen_tools::ToolError> {
+        async fn run(
+            &self,
+            _: &ToolCtx,
+            _: &str,
+            input: Value,
+        ) -> Result<String, bullpen_tools::ToolError> {
             Ok(format!("echo: {}", input["value"]))
         }
     }
@@ -275,7 +284,9 @@ mod tests {
                 StopReason::ToolUse,
             ),
             response(
-                vec![ContentBlock::Text { text: "done".into() }],
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 StopReason::EndTurn,
             ),
         ]);
@@ -296,14 +307,19 @@ mod tests {
 
         // A follow-up run seeded from the durable transcript works.
         let provider = FakeProvider::new(vec![response(
-            vec![ContentBlock::Text { text: "again".into() }],
+            vec![ContentBlock::Text {
+                text: "again".into(),
+            }],
             StopReason::EndTurn,
         )]);
         let (messages, _) = prepare_session(&mut open_store(&dir), &session.id).unwrap();
         let mut agent = agent_with(open_store(&dir), &session.id, provider);
         agent = agent.with_transcript(messages, session.usage);
         assert_eq!(agent.send("more").await.unwrap(), "again");
-        assert_eq!(open_store(&dir).path_messages(&session.id).unwrap().len(), 6);
+        assert_eq!(
+            open_store(&dir).path_messages(&session.id).unwrap().len(),
+            6
+        );
     }
 
     #[tokio::test]
@@ -397,7 +413,11 @@ mod tests {
         let (messages, recovery) = prepare_session(&mut store, &session.id).unwrap();
         let recovery = recovery.expect("recovery ran");
         assert_eq!(recovery.interrupted_tools, 1);
-        let ContentBlock::ToolResult { tool_use_id, is_error, .. } = &messages[2].content[0]
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            is_error,
+            ..
+        } = &messages[2].content[0]
         else {
             panic!("expected synthetic result, got {:?}", messages[2]);
         };

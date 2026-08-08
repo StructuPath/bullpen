@@ -137,9 +137,7 @@ pub struct Response {
 impl Response {
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => {
-                Some((id.as_str(), name.as_str(), input))
-            }
+            ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
             _ => None,
         })
     }

@@ -265,7 +265,11 @@ struct StreamAccumulator {
 
 enum StreamBlock {
     Text(String),
-    ToolUse { id: String, name: String, json: String },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
     Ignored,
 }
 
@@ -309,7 +313,8 @@ impl StreamAccumulator {
                 let delta = event.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
                     Some("text_delta") => {
-                        if let Some(text) = delta.and_then(|d| d.get("text")).and_then(Value::as_str)
+                        if let Some(text) =
+                            delta.and_then(|d| d.get("text")).and_then(Value::as_str)
                         {
                             let _ = deltas.send(text.to_string());
                             if let Some(StreamBlock::Text(acc)) = self.blocks.get_mut(idx) {
@@ -577,7 +582,9 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     content: vec![
-                        ContentBlock::Text { text: "checking".into() },
+                        ContentBlock::Text {
+                            text: "checking".into(),
+                        },
                         ContentBlock::ToolUse {
                             id: "tu_1".into(),
                             name: "bash".into(),
@@ -672,7 +679,13 @@ mod tests {
         assert_eq!(kimi.name(), "kimi");
         assert_eq!(kimi.auth, AuthStyle::Bearer);
         // Both produce identical wire bodies to Anthropic proper.
-        assert_eq!(to_wire(&sample_request(), false)["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            to_wire(&sample_request(), false)["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

@@ -70,7 +70,10 @@ pub async fn capture_code(listener: TcpListener) -> Result<String, AuthError> {
         let mut buf = vec![0u8; 8 * 1024];
         let n = stream.read(&mut buf).await?;
         let request = String::from_utf8_lossy(&buf[..n]);
-        let Some(target) = request.lines().next().and_then(|l| l.split_whitespace().nth(1))
+        let Some(target) = request
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
         else {
             continue;
         };
@@ -91,9 +94,15 @@ pub async fn capture_code(listener: TcpListener) -> Result<String, AuthError> {
             continue;
         }
         let (status, page) = if code.is_some() {
-            ("200 OK", "bullpen is connected to OpenRouter. You can close this tab.")
+            (
+                "200 OK",
+                "bullpen is connected to OpenRouter. You can close this tab.",
+            )
         } else {
-            ("200 OK", "Authorization was not completed. You can close this tab.")
+            (
+                "200 OK",
+                "Authorization was not completed. You can close this tab.",
+            )
         };
         let _ = respond(&mut stream, status, page).await;
 
@@ -197,7 +206,9 @@ mod tests {
 
         // A stray request first — must not terminate the wait.
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        s.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").await.unwrap();
+        s.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf).await;
 

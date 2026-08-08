@@ -350,7 +350,9 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     content: vec![
-                        ContentBlock::Text { text: "checking".into() },
+                        ContentBlock::Text {
+                            text: "checking".into(),
+                        },
                         ContentBlock::ToolUse {
                             id: "call_1".into(),
                             name: "bash".into(),
@@ -370,7 +372,9 @@ mod tests {
                             content: "README.md".into(),
                             is_error: false,
                         },
-                        ContentBlock::Text { text: "now continue".into() },
+                        ContentBlock::Text {
+                            text: "now continue".into(),
+                        },
                     ],
                 },
             ],
@@ -445,7 +449,12 @@ mod tests {
         .unwrap();
         let resp = from_wire(wire).unwrap();
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
-        assert_eq!(resp.content, vec![ContentBlock::Text { text: "hello".into() }]);
+        assert_eq!(
+            resp.content,
+            vec![ContentBlock::Text {
+                text: "hello".into()
+            }]
+        );
     }
 
     #[test]

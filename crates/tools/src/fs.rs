@@ -48,7 +48,11 @@ impl Tool for ReadFile {
             .map_err(|e| ToolError::Failed(format!("cannot read {}: {e}", path.display())))?;
         let text = String::from_utf8_lossy(&raw);
 
-        let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let offset = input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
@@ -63,7 +67,10 @@ impl Tool for ReadFile {
             .collect();
 
         if numbered.is_empty() {
-            return Ok(format!("(empty selection: file has {} lines)", text.lines().count()));
+            return Ok(format!(
+                "(empty selection: file has {} lines)",
+                text.lines().count()
+            ));
         }
         Ok(truncate_middle(numbered, MAX_READ_BYTES))
     }
@@ -99,14 +106,18 @@ impl Tool for WriteFile {
         let content = required_str(&input, "content")?;
         ctx.check_write(&path)?;
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ToolError::Failed(format!("cannot create {}: {e}", parent.display())))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ToolError::Failed(format!("cannot create {}: {e}", parent.display()))
+            })?;
         }
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| ToolError::Failed(format!("cannot write {}: {e}", path.display())))?;
-        Ok(format!("wrote {} bytes to {}", content.len(), path.display()))
+        Ok(format!(
+            "wrote {} bytes to {}",
+            content.len(),
+            path.display()
+        ))
     }
 }
 
@@ -141,7 +152,9 @@ impl Tool for EditFile {
         let old = required_str(&input, "old_string")?;
         let new = required_str(&input, "new_string")?;
         if old.is_empty() {
-            return Err(ToolError::InvalidInput("old_string must not be empty".into()));
+            return Err(ToolError::InvalidInput(
+                "old_string must not be empty".into(),
+            ));
         }
         ctx.check_write(&path)?;
 
@@ -156,9 +169,9 @@ impl Tool for EditFile {
             ))),
             1 => {
                 let updated = text.replacen(old, new, 1);
-                tokio::fs::write(&path, updated)
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("cannot write {}: {e}", path.display())))?;
+                tokio::fs::write(&path, updated).await.map_err(|e| {
+                    ToolError::Failed(format!("cannot write {}: {e}", path.display()))
+                })?;
                 Ok(format!("edited {}", path.display()))
             }
             n => Err(ToolError::Failed(format!(
@@ -182,10 +195,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         WriteFile
-            .run(&c, "t", json!({"path": "sub/f.txt", "content": "one\ntwo\nthree"}))
+            .run(
+                &c,
+                "t",
+                json!({"path": "sub/f.txt", "content": "one\ntwo\nthree"}),
+            )
             .await
             .unwrap();
-        let out = ReadFile.run(&c, "t", json!({"path": "sub/f.txt"})).await.unwrap();
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "sub/f.txt"}))
+            .await
+            .unwrap();
         assert_eq!(out, "1\tone\n2\ttwo\n3\tthree\n");
     }
 
@@ -209,11 +229,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = ctx(&dir);
         WriteFile
-            .run(&c, "t", json!({"path": "f.txt", "content": "x = 1\nx = 1\n"}))
+            .run(
+                &c,
+                "t",
+                json!({"path": "f.txt", "content": "x = 1\nx = 1\n"}),
+            )
             .await
             .unwrap();
         let err = EditFile
-            .run(&c, "t", json!({"path": "f.txt", "old_string": "x = 1", "new_string": "x = 2"}))
+            .run(
+                &c,
+                "t",
+                json!({"path": "f.txt", "old_string": "x = 1", "new_string": "x = 2"}),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("2 times"));
@@ -222,7 +250,10 @@ mod tests {
             .run(&c, "t", json!({"path": "f.txt", "old_string": "x = 1\nx = 1", "new_string": "x = 2\nx = 1"}))
             .await
             .unwrap();
-        let out = ReadFile.run(&c, "t", json!({"path": "f.txt"})).await.unwrap();
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "f.txt"}))
+            .await
+            .unwrap();
         assert!(out.contains("x = 2"));
     }
 
@@ -240,7 +271,11 @@ mod tests {
 
         // Absolute path outside the workspace: refused in-process.
         let err = WriteFile
-            .run(&c, "t", json!({"path": "/etc/bullpen-escape", "content": "x"}))
+            .run(
+                &c,
+                "t",
+                json!({"path": "/etc/bullpen-escape", "content": "x"}),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("sandbox"), "{err}");
@@ -255,7 +290,11 @@ mod tests {
             .await
             .unwrap();
         let err = EditFile
-            .run(&c, "t", json!({"path": "f.txt", "old_string": "absent", "new_string": "y"}))
+            .run(
+                &c,
+                "t",
+                json!({"path": "f.txt", "old_string": "absent", "new_string": "y"}),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));

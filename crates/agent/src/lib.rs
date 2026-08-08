@@ -232,10 +232,7 @@ impl Agent {
                         tool_use_id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
-                        replay_safe: self
-                            .registry
-                            .get(name)
-                            .is_some_and(|t| t.replay_safe()),
+                        replay_safe: self.registry.get(name).is_some_and(|t| t.replay_safe()),
                     }),
                     _ => None,
                 })
@@ -346,7 +343,12 @@ impl Agent {
         (output, is_error)
     }
 
-    async fn run_tool(&self, name: &str, call_id: &str, input: serde_json::Value) -> (String, bool) {
+    async fn run_tool(
+        &self,
+        name: &str,
+        call_id: &str,
+        input: serde_json::Value,
+    ) -> (String, bool) {
         let Some(tool) = self.registry.get(name) else {
             return (format!("unknown tool: {name}"), true);
         };
@@ -526,7 +528,9 @@ mod tests {
         let mut agent = agent(provider);
         let out = agent.send("go").await.unwrap();
         assert_eq!(out, "recovered");
-        let ContentBlock::ToolResult { is_error, content, .. } = &agent.messages()[2].content[0]
+        let ContentBlock::ToolResult {
+            is_error, content, ..
+        } = &agent.messages()[2].content[0]
         else {
             panic!("expected tool result");
         };
@@ -739,7 +743,11 @@ mod tests {
             self.0.lock().unwrap().push("results".into());
             Ok(())
         }
-        async fn run_finished(&mut self, outcome: RunOutcome, _: Usage) -> Result<(), JournalError> {
+        async fn run_finished(
+            &mut self,
+            outcome: RunOutcome,
+            _: Usage,
+        ) -> Result<(), JournalError> {
             self.0
                 .lock()
                 .unwrap()
@@ -824,6 +832,9 @@ mod tests {
                 Event::TurnDone { .. } => "done",
             });
         }
-        assert_eq!(kinds, vec!["text", "tool_start", "tool_end", "text", "done"]);
+        assert_eq!(
+            kinds,
+            vec!["text", "tool_start", "tool_end", "text", "done"]
+        );
     }
 }

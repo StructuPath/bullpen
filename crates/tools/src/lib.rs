@@ -176,7 +176,14 @@ mod tests {
         assert_eq!(names, sorted);
         assert_eq!(
             names,
-            vec!["bash", "edit_file", "glob", "grep", "read_file", "write_file"]
+            vec![
+                "bash",
+                "edit_file",
+                "glob",
+                "grep",
+                "read_file",
+                "write_file"
+            ]
         );
     }
 

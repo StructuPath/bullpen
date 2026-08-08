@@ -130,7 +130,12 @@ mod tests {
         let s = store.create_session("/tmp", "anthropic", "m").unwrap();
         let run = store.start_operation(&s.id, &json!({})).unwrap();
         store
-            .append_entry(&s.id, "e-user", "message", &payload(&Message::user_text("go")))
+            .append_entry(
+                &s.id,
+                "e-user",
+                "message",
+                &payload(&Message::user_text("go")),
+            )
             .unwrap();
         let assistant = Message {
             role: Role::Assistant,
@@ -166,7 +171,9 @@ mod tests {
         let (_dir, mut store) = store();
         let (session, run) = crashed_mid_batch(&mut store);
 
-        let recovery = recover(&mut store, &session).unwrap().expect("suspended run");
+        let recovery = recover(&mut store, &session)
+            .unwrap()
+            .expect("suspended run");
         assert_eq!(recovery.run_id, run);
         assert_eq!(recovery.interrupted_tools, 1);
         assert!(recovery.closed_with_note);
@@ -175,7 +182,11 @@ mod tests {
         // interrupted result, then a closing assistant message.
         let messages = store.path_messages(&session).unwrap();
         assert_eq!(messages.len(), 4);
-        let ContentBlock::ToolResult { tool_use_id, is_error, content } = &messages[2].content[0]
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            is_error,
+            content,
+        } = &messages[2].content[0]
         else {
             panic!("expected synthetic tool result");
         };
@@ -220,7 +231,10 @@ mod tests {
         // Real result survives untouched; closing note still appended
         // because the leaf ended on a user(tool-results) message.
         let messages = store.path_messages(&session).unwrap();
-        let ContentBlock::ToolResult { content, is_error, .. } = &messages[2].content[0] else {
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &messages[2].content[0]
+        else {
             panic!("expected result");
         };
         assert_eq!(content, "deployed");

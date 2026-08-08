@@ -19,9 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::retry;
 use crate::sse;
-use crate::{
-    ContentBlock, Provider, ProviderError, Request, Response, Role, StopReason, Usage,
-};
+use crate::{ContentBlock, Provider, ProviderError, Request, Response, Role, StopReason, Usage};
 
 const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 /// Fallback when neither `-m` nor a Codex CLI config supplies a model.
@@ -249,7 +247,11 @@ fn to_input(req: &Request) -> Vec<Value> {
 /// replay: type "reasoning", non-empty id and encrypted_content, and a
 /// summary that is either absent or a real array.
 fn replayable_reasoning(data: &Value) -> bool {
-    let nonempty = |key: &str| data.get(key).and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    let nonempty = |key: &str| {
+        data.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
     if data.get("type").and_then(Value::as_str) != Some("reasoning")
         || !nonempty("id")
         || !nonempty("encrypted_content")
@@ -335,11 +337,21 @@ fn to_response(body: &Value) -> Result<Response, ProviderError> {
 
     let mut content = Vec::new();
     let mut saw_tool_call = false;
-    for item in body.get("output").and_then(Value::as_array).into_iter().flatten() {
+    for item in body
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         match item.get("type").and_then(Value::as_str).unwrap_or("") {
             "message" => {
                 let mut text = String::new();
-                for part in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     match part.get("type").and_then(Value::as_str).unwrap_or("") {
                         "output_text" => {
                             text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
@@ -445,7 +457,9 @@ mod tests {
                                 "summary": []
                             }),
                         },
-                        ContentBlock::Text { text: "running".into() },
+                        ContentBlock::Text {
+                            text: "running".into(),
+                        },
                         ContentBlock::ToolUse {
                             id: "call_1".into(),
                             name: "bash".into(),
@@ -499,7 +513,13 @@ mod tests {
             data: json!({"type": "reasoning", "id": "x", "encrypted_content": "y"}),
         };
         let wire = build_request(&req);
-        assert!(!wire["input"].as_array().unwrap().iter().any(|i| i["type"] == "reasoning"));
+        assert!(
+            !wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "reasoning")
+        );
 
         // summary present but not an array → not replayable
         assert!(!replayable_reasoning(&json!({
@@ -524,7 +544,9 @@ mod tests {
         assert_eq!(resp.stop_reason, StopReason::ToolUse);
         assert_eq!(resp.usage.input_tokens, 11);
         assert_eq!(resp.content.len(), 3);
-        assert!(matches!(&resp.content[0], ContentBlock::Opaque { provider, .. } if provider == "codex"));
+        assert!(
+            matches!(&resp.content[0], ContentBlock::Opaque { provider, .. } if provider == "codex")
+        );
         assert!(matches!(&resp.content[1], ContentBlock::Text { text } if text == "checking"));
         let ContentBlock::ToolUse { id, name, input } = &resp.content[2] else {
             panic!("expected tool use");
