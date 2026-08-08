@@ -269,7 +269,10 @@ pub fn locate(
 /// where `git worktree add` fails on the occupied path with an error that
 /// says nothing about what is actually in the way.
 fn inspect(anchor: &Path, path: &Path, branch: &str) -> Candidate {
-    if !path.exists() {
+    // `symlink_metadata` rather than `exists`, which follows links: a dangling
+    // symlink at the recorded path is an obstruction that reports itself
+    // absent, and `Gone` would send resume into a recreate git then refuses.
+    if std::fs::symlink_metadata(path).is_err() {
         return Candidate::Gone;
     }
     if !path.is_dir() {
@@ -533,6 +536,76 @@ mod tests {
         create(&root, &path, "bullpen/s1").unwrap();
         std::fs::remove_dir_all(&path).unwrap();
         std::fs::write(&path, "not a worktree").unwrap();
+
+        assert_eq!(
+            locate(path.to_str(), Some("bullpen/s1"), &root),
+            Location::Occupied {
+                path,
+                branch: "bullpen/s1".into()
+            }
+        );
+    }
+
+    /// A dangling symlink is an obstruction that reports itself absent.
+    /// `Path::exists` follows the link and says no; `symlink_metadata` sees
+    /// the link itself. Getting this wrong sends resume into a recreate that
+    /// git refuses, because something does occupy the path.
+    #[test]
+    fn a_dangling_symlink_at_the_recorded_path_is_occupied_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init_repo(&root);
+        let path = dir.path().join("worktrees").join("s1");
+
+        // The branch exists, so a wrong "gone" would mean Recreate.
+        create(&root, &path, "bullpen/s1").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &path).unwrap();
+        assert!(!path.exists(), "the link dangles");
+
+        assert_eq!(
+            locate(path.to_str(), Some("bullpen/s1"), &root),
+            Location::Occupied {
+                path,
+                branch: "bullpen/s1".into()
+            }
+        );
+    }
+
+    /// A detached worktree has no branch to agree with. Accepting it would let
+    /// a resumed session commit where the recorded branch name can never reach
+    /// the work again. `git symbolic-ref -q HEAD` exits nonzero when detached,
+    /// so a check that treats failure as agreement gets this backwards.
+    #[test]
+    fn a_detached_worktree_at_the_recorded_path_is_not_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init_repo(&root);
+        let path = dir.path().join("worktrees").join("s1");
+
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        create(&root, &path, "bullpen/s1").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        git(&["worktree", "prune"]);
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ]);
 
         assert_eq!(
             locate(path.to_str(), Some("bullpen/s1"), &root),
