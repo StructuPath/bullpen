@@ -246,30 +246,63 @@ pub fn locate(
     let Some((path, branch)) = recorded_path.zip(recorded_branch) else {
         return Location::Shared;
     };
-    let candidate = inspect(anchor, Path::new(path));
+    let candidate = inspect(anchor, Path::new(path), branch);
     let branch_lives = candidate == Candidate::Gone
         && repo_root(anchor).is_ok_and(|root| branch_exists(&root, branch));
     decide(Some((path, branch)), candidate, branch_lives)
 }
 
-/// Whether `path` really is a worktree of the repository `anchor` sits in.
-/// `is_dir` alone would accept an ordinary directory left at the recorded
-/// path — running there is the silent misplacement the recording exists to
-/// prevent — so both the shared git directory and the worktree's own top
-/// level have to agree.
-fn inspect(anchor: &Path, path: &Path) -> Candidate {
-    if !path.is_dir() {
+/// Whether `path` really is *this session's* worktree of the repository
+/// `anchor` sits in. Three things have to agree, and each guards a different
+/// way of ending up in the wrong tree:
+///
+/// - the shared git directory, so a worktree of another repository is not
+///   mistaken for this one;
+/// - the worktree's own top level, so an ordinary directory left at the
+///   recorded path is not run in;
+/// - the checked-out branch, so a *different* worktree of the same
+///   repository restored at this path does not capture the session. Without
+///   this a resumed session commits to whatever branch happens to be there.
+///
+/// Anything that exists at the path but is not that worktree is `Foreign`,
+/// including a regular file: `Gone` would send resume down the recreate path,
+/// where `git worktree add` fails on the occupied path with an error that
+/// says nothing about what is actually in the way.
+fn inspect(anchor: &Path, path: &Path, branch: &str) -> Candidate {
+    if !path.exists() {
         return Candidate::Gone;
+    }
+    if !path.is_dir() {
+        return Candidate::Foreign;
     }
     let same_repo = rev_parse_dir(path, "--git-common-dir")
         .zip(rev_parse_dir(anchor, "--git-common-dir"))
         .is_some_and(|(candidate, anchor)| candidate == anchor);
     let is_top_level = repo_root(path).is_ok_and(|top| canonical(&top) == canonical(path));
-    if same_repo && is_top_level {
+    let same_branch = head_branch(path).is_some_and(|head| head == branch);
+    if same_repo && is_top_level && same_branch {
         Candidate::Live
     } else {
         Candidate::Foreign
     }
+}
+
+/// The branch checked out at `path`, or `None` when the worktree is detached
+/// or the path is not a worktree at all. A detached HEAD is deliberately not
+/// a match: the recording names a branch, and resuming onto a detached head
+/// would leave the work unreachable by that name.
+fn head_branch(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -440,6 +473,72 @@ mod tests {
             Location::Recreate {
                 path,
                 branch: "bullpen/s1".into(),
+            }
+        );
+    }
+
+    /// The path and the repository can both match while the branch does not.
+    /// Removing a session's worktree and putting another one from the same
+    /// repository at that path must not capture the session — resuming into
+    /// it would commit the agent's work to whatever branch it found.
+    #[test]
+    fn a_worktree_of_the_same_repo_on_another_branch_is_not_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init_repo(&root);
+        let path = dir.path().join("worktrees").join("s1");
+
+        create(&root, &path, "bullpen/s1").unwrap();
+        assert_eq!(
+            locate(path.to_str(), Some("bullpen/s1"), &root),
+            Location::Use(path.clone())
+        );
+
+        // Same path, same repository, different branch — what a user gets by
+        // clearing the directory and reusing the path. `prune` drops git's
+        // administrative entry for the deleted worktree, which otherwise
+        // still claims the path.
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["worktree", "prune"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        create(&root, &path, "someone-elses-branch").unwrap();
+        assert_eq!(
+            locate(path.to_str(), Some("bullpen/s1"), &root),
+            Location::Occupied {
+                path: path.clone(),
+                branch: "bullpen/s1".into()
+            }
+        );
+    }
+
+    /// A regular file at the recorded path is in the way, not absent.
+    /// Reporting it as gone sends resume down the recreate path, where
+    /// `git worktree add` fails with an error that never mentions the file.
+    #[test]
+    fn a_regular_file_at_the_recorded_path_is_occupied_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init_repo(&root);
+        let path = dir.path().join("worktrees").join("s1");
+
+        // The branch exists, so "gone" would mean Recreate.
+        create(&root, &path, "bullpen/s1").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, "not a worktree").unwrap();
+
+        assert_eq!(
+            locate(path.to_str(), Some("bullpen/s1"), &root),
+            Location::Occupied {
+                path,
+                branch: "bullpen/s1".into()
             }
         );
     }
