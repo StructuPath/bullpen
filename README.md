@@ -31,7 +31,19 @@ bullpen run --sandbox "refactor X"    # confine writes to the workspace (Seatbel
 bullpen run -v "..."                  # show tool activity on stderr
 bullpen sessions                      # list stored sessions
 bullpen run -r <id-prefix> "follow-up question"   # resumes with the session's provider
+
+# Dispatch and watch many background sessions from one screen:
+bullpen run --bg "audit the auth module"   # detached; returns immediately
+bullpen agents                             # dashboard: grouped, live, dispatch + peek
+bullpen logs <id-prefix>                   # tail a background session's output
 ```
+
+**Agent view** (`bullpen agents`) manages background sessions from one
+screen — dispatch, watch them work, peek their output. It's daemonless:
+each background session is a detached `bullpen run` that coordinates through
+the SQLite store, so they keep running after you close the dashboard, survive
+crashes (a dead process shows as Failed and resumes on `run -r`), and appear
+in `bullpen sessions` like anything else.
 
 Providers: **anthropic** (true token streaming + prompt caching), **codex**
 (ChatGPT subscription), **openrouter**, **glm**, **kimi**. `--sandbox`

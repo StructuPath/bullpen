@@ -15,8 +15,10 @@
 //! re-running recovery safe.
 
 mod recovery;
+pub mod status;
 
 pub use recovery::{Recovery, recover};
+pub use status::AgentStatus;
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +57,10 @@ pub struct Session {
     pub updated_at: String,
     /// Set for pen children; the parent session's id.
     pub parent_session_id: Option<String>,
+    /// Last recorded run status: idle | running | completed | failed.
+    pub status: String,
+    /// OS process id of the last run, for liveness checks.
+    pub pid: Option<i64>,
 }
 
 /// One conversation entry. `payload` holds a [`Message`] for kind
@@ -100,7 +106,8 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "busy_timeout", 5_000)?;
+        // Wait, rather than fail, when another writer holds the lock.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -196,6 +203,15 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 5 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'idle';
+                 ALTER TABLE sessions ADD COLUMN pid INTEGER;
+                 PRAGMA user_version = 5;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -275,11 +291,26 @@ impl Store {
             }))
     }
 
+    /// Record the run status (and process id) for the dashboard.
+    pub fn set_run_status(
+        &self,
+        session_id: &str,
+        status: &str,
+        pid: Option<i64>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET status = ?2, pid = ?3, updated_at = datetime('now')
+             WHERE id = ?1",
+            params![session_id, status, pid],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Session, StoreError> {
         self.conn
             .query_row(
                 "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                        created_at, updated_at, parent_session_id
+                        created_at, updated_at, parent_session_id, status, pid
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -293,7 +324,7 @@ impl Store {
     pub fn resolve_session(&self, prefix: &str) -> Result<Session, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                    created_at, updated_at, parent_session_id
+                    created_at, updated_at, parent_session_id, status, pid
              FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut matches: Vec<Session> = stmt
@@ -309,7 +340,7 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                    created_at, updated_at, parent_session_id
+                    created_at, updated_at, parent_session_id, status, pid
              FROM sessions ORDER BY updated_at DESC",
         )?;
         Ok(stmt
@@ -352,7 +383,12 @@ impl Store {
         kind: &str,
         payload: &Value,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        // IMMEDIATE: take the write lock up front so a concurrent writer makes
+        // us wait (honoring busy_timeout) rather than failing with
+        // SQLITE_BUSY_SNAPSHOT when a deferred read-then-write upgrade races.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)",
             params![provisioned_id],
@@ -454,7 +490,9 @@ impl Store {
         kind: &str,
         payload: &Value,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM records WHERE id = ?1)",
             params![id],
@@ -637,6 +675,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
         parent_session_id: row.get(9)?,
+        status: row.get(10)?,
+        pid: row.get(11)?,
     })
 }
 

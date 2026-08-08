@@ -4,6 +4,9 @@
 //! credentials, the tool registry, the store, and the agent loop together.
 //! Core crates never reach up into here.
 
+mod agents;
+mod bg;
+
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -55,6 +58,17 @@ enum Command {
         /// (macOS only). Implies --sandbox.
         #[arg(long)]
         sandbox_strict: bool,
+        /// Dispatch as a detached background session and return immediately.
+        /// Watch it with `bullpen agents`.
+        #[arg(long)]
+        bg: bool,
+    },
+    /// Dispatch and monitor background sessions from one screen.
+    Agents,
+    /// Print a background session's captured output.
+    Logs {
+        /// Session id or unique prefix.
+        session: String,
     },
     /// Connect a provider account (stores credentials in ~/.bullpen).
     Login {
@@ -160,7 +174,22 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             sandbox,
             sandbox_strict,
-        } => run(prompt, provider, model, resume, verbose, sandbox, sandbox_strict).await,
+            bg,
+        } => {
+            run(
+                prompt,
+                provider,
+                model,
+                resume,
+                verbose,
+                sandbox,
+                sandbox_strict,
+                bg,
+            )
+            .await
+        }
+        Command::Agents => agents::run(),
+        Command::Logs { session } => logs(&session),
         Command::Login { provider, headless } => match provider {
             LoginProvider::Openrouter => login_openrouter(headless).await,
             LoginProvider::Codex => login_codex().await,
@@ -299,8 +328,37 @@ async fn run(
     verbose: bool,
     sandbox: bool,
     sandbox_strict: bool,
+    bg: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
+
+    // Background dispatch: create/resolve the session here so we have an id to
+    // hand back and to spawn a detached child against, then return.
+    if bg {
+        let store = Store::open(&Store::default_path())?;
+        let session = match &resume {
+            Some(prefix) => store.resolve_session(prefix)?,
+            None => {
+                let model = model.unwrap_or_else(|| provider_kind.default_model());
+                store.create_session(&cwd.display().to_string(), provider_kind.name(), &model)?
+            }
+        };
+        let mut extra = Vec::new();
+        if sandbox_strict {
+            extra.push("--sandbox-strict".to_string());
+        } else if sandbox {
+            extra.push("--sandbox".to_string());
+        }
+        let pid = bg::spawn_detached(&session.id, &prompt, &extra)?;
+        store.set_run_status(&session.id, "running", Some(pid as i64))?;
+        println!("dispatched {} (pid {pid})", &session.id[..8]);
+        eprintln!(
+            "  bullpen agents            watch it\n  bullpen logs {}          tail its output\n  bullpen run -r {} \"...\"   continue it",
+            &session.id[..8],
+            &session.id[..8]
+        );
+        return Ok(());
+    }
 
     // Build the write-confinement sandbox, if requested.
     let sandbox = if sandbox_strict {
@@ -349,6 +407,9 @@ async fn run(
         );
     }
     let usage = store.get_session(&session.id)?.usage;
+    // Mark this session as actively running under our pid, so the dashboard
+    // shows it as Working (and as a crash if this process dies mid-run).
+    store.set_run_status(&session.id, "running", Some(std::process::id() as i64))?;
     drop(store);
 
     let provider = build_provider(provider_kind)?;
@@ -432,6 +493,12 @@ async fn run(
     let _ = printer.await;
     let _ = streamer.await;
 
+    // Record the terminal run status for the dashboard.
+    let final_status = if result.is_ok() { "completed" } else { "failed" };
+    if let Ok(store) = Store::open(&Store::default_path()) {
+        let _ = store.set_run_status(&session.id, final_status, None);
+    }
+
     match result {
         Ok(_) => {
             // The answer already streamed to stdout; just close the line.
@@ -449,6 +516,22 @@ async fn run(
             println!();
             bail!("agent error (session {} saved): {e}", &session.id[..8])
         }
+    }
+}
+
+fn logs(prefix: &str) -> anyhow::Result<()> {
+    let store = Store::open(&Store::default_path())?;
+    let session = store.resolve_session(prefix)?;
+    let path = bg::log_path(&session.id);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            print!("{text}");
+            Ok(())
+        }
+        Err(_) => bail!(
+            "no captured output for {} (only --bg sessions write a log)",
+            &session.id[..8]
+        ),
     }
 }
 
