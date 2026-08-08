@@ -2,8 +2,9 @@
 //!
 //! Two credential shapes cover every supported provider: plain API keys
 //! (OpenRouter, and later GLM/Kimi/Anthropic) and OAuth token sets with
-//! refresh (ChatGPT/Codex). Everything lives in `~/.bullpen/auth.json`,
-//! written atomically with mode 0600.
+//! refresh (ChatGPT/Codex). Everything lives in `~/.bullpen/auth.json` (or
+//! `$BULLPEN_HOME/auth.json` when that is set), written atomically with mode
+//! 0600.
 //!
 //! This crate also implements `bullpen_llm::codex::TokenSource` twice:
 //! [`codex::StoredCodex`] (bullpen's own login, refreshes and persists) and
@@ -16,6 +17,7 @@ pub mod openrouter;
 pub mod pkce;
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,23 @@ pub enum Credential {
     },
 }
 
+/// The directory holding bullpen's own state: `$BULLPEN_HOME` when set,
+/// otherwise `~/.bullpen`.
+pub fn home_dir() -> PathBuf {
+    resolve_home(std::env::var_os("BULLPEN_HOME"), std::env::home_dir())
+}
+
+/// `bullpen_home` is `$BULLPEN_HOME` and `home` is `$HOME` (the caller reads
+/// the environment). An empty `BULLPEN_HOME` counts as unset: taken
+/// literally it would put credentials in whatever directory the process
+/// happened to start in.
+fn resolve_home(bullpen_home: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+    match bullpen_home {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home.unwrap_or_else(|| PathBuf::from(".")).join(".bullpen"),
+    }
+}
+
 /// The on-disk credential store.
 #[derive(Debug)]
 pub struct AuthFile {
@@ -58,10 +77,7 @@ pub struct AuthFile {
 
 impl AuthFile {
     pub fn default_path() -> PathBuf {
-        std::env::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".bullpen")
-            .join("auth.json")
+        home_dir().join("auth.json")
     }
 
     /// Load the store; a missing file is an empty store.
@@ -128,6 +144,31 @@ pub(crate) fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_bullpen_home_still_resolves_under_dot_bullpen() {
+        assert_eq!(
+            resolve_home(None, Some(PathBuf::from("/h"))).join("auth.json"),
+            PathBuf::from("/h/.bullpen/auth.json")
+        );
+        // No $HOME either — the long-standing relative fallback.
+        assert_eq!(
+            resolve_home(None, None).join("auth.json"),
+            PathBuf::from("./.bullpen/auth.json")
+        );
+    }
+
+    #[test]
+    fn bullpen_home_overrides_the_default_directory() {
+        assert_eq!(
+            resolve_home(Some("/tmp/pen".into()), Some(PathBuf::from("/h"))).join("auth.json"),
+            PathBuf::from("/tmp/pen/auth.json")
+        );
+        assert_eq!(
+            resolve_home(Some("".into()), Some(PathBuf::from("/h"))).join("auth.json"),
+            PathBuf::from("/h/.bullpen/auth.json")
+        );
+    }
 
     #[test]
     fn roundtrip_and_missing_file() {

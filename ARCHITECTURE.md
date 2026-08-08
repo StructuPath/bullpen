@@ -30,7 +30,7 @@ crates above it in this table:
 | Crate | Owns | Must never know about |
 |---|---|---|
 | `bullpen-llm` | Provider-neutral conversation types, `Provider` trait, wire-format adapters (Anthropic messages, OpenAI chat-completions, Codex Responses/SSE), shared retry policy | Tools, transcripts, UI |
-| `bullpen-auth` | Credential store (`~/.bullpen/auth.json`, 0600, atomic), PKCE, OpenRouter OAuth, Codex device-code flow + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
+| `bullpen-auth` | Credential store (`~/.bullpen/auth.json` or `$BULLPEN_HOME/auth.json`, 0600, atomic), PKCE, OpenRouter OAuth, Codex device-code flow + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
 | `bullpen-tools` | `Tool` trait, `Registry`, built-ins (bash, read/write/edit, grep, glob), parallel-safety flags | Providers, the loop |
 | `bullpen-store` | SQLite persistence: sessions, transcripts, usage; schema migrations via `user_version` | Providers, tools, the loop |
 | `bullpen-agent` | The loop: transcript, provider calls, tool continuation, events, max-turns fuse, the `Journal` durability protocol (trait only) | Config files, sessions, vendors, UI, storage |
@@ -101,6 +101,7 @@ never stops the loop.
 
 One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
 versioned by `pragma user_version`. Session ids resolve by unique prefix.
+`BULLPEN_HOME` overrides the directory (see README, "Where state lives").
 
 The durability rule, the reduction idea, and the recovery discipline below
 are adapted from pi's `harness-v2.md` design spec — see

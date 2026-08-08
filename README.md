@@ -126,8 +126,11 @@ Reading it while sessions run needs the immutable flag, since WAL databases
 can't be opened read-only without their shared-memory file:
 
 ```bash
-sqlite3 "file:$HOME/.bullpen/bullpen.db?immutable=1" "select id, status from sessions"
+sqlite3 "file:${BULLPEN_HOME:-$HOME/.bullpen}/bullpen.db?immutable=1" "select id, status from sessions"
 ```
+
+Set `BULLPEN_HOME` to move the whole directory — database, `auth.json`, and
+background logs land directly in it, with no `.bullpen` segment appended.
 
 ## Status
 
