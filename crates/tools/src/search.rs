@@ -175,9 +175,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {\n    steel();\n}\n").unwrap();
         std::fs::write(root.join("notes.md"), "steel beams\n").unwrap();
-        let ctx = ToolCtx {
-            workspace: root.to_path_buf(),
-        };
+        let ctx = ToolCtx::new(root.to_path_buf());
         (dir, ctx)
     }
 

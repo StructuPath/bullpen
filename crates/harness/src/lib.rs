@@ -245,9 +245,7 @@ mod tests {
         Agent::new(
             provider,
             registry,
-            ToolCtx {
-                workspace: std::env::temp_dir(),
-            },
+            ToolCtx::new(std::env::temp_dir()),
             AgentConfig {
                 model: "test".into(),
                 system: "test".into(),
@@ -378,9 +376,7 @@ mod tests {
         let mut agent = Agent::new(
             provider,
             registry,
-            ToolCtx {
-                workspace: std::env::temp_dir(),
-            },
+            ToolCtx::new(std::env::temp_dir()),
             AgentConfig {
                 model: "test".into(),
                 system: "test".into(),

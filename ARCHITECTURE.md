@@ -224,10 +224,20 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   and a crash mid-batch synthesizes the whole batch on recovery. Still open
   for M2.x: live child event streaming to the parent's UI, token budgets
   (needs the usage ledger).
-- **M3 — Sandbox + permissions.** `sandbox` crate: capability grants (fs
-  read/write path sets, network, process spawn) resolved per tool call;
-  Seatbelt profile generation on macOS, Landlock on Linux. Approvals become
-  persisted authorization decisions, not UI friction.
+- **M3 — Sandbox + permissions.** Landed 2026-08-07 as write-confinement.
+  `bullpen-sandbox` enforces the workspace boundary two ways together: an
+  in-process `allows_write` check the file tools consult (all platforms,
+  catches `..` and symlink escapes by resolving to real paths), and, on
+  macOS, a generated Seatbelt (`sandbox-exec`) profile that confines shell
+  commands *and their children* to the workspace + system temp, optionally
+  denying network (`--sandbox` / `--sandbox-strict`). Scope is deliberate:
+  it is write-confinement, not a full jail — reads stay broad because
+  toolchains legitimately read across the system. Applies to the top-level
+  agent and to pen work-children. Live-verified: a shell write to `$HOME`
+  under `--sandbox` is denied by the OS while a workspace write succeeds.
+  Still open: Landlock for Linux shell confinement (the in-process check
+  already works there); a persisted per-tool authorization model beyond the
+  workspace boundary.
 - **M4 — TUI.** `ratatui` front-end over the same event stream: transcript,
   tool cards, pen tree, steering, approvals.
 - **M5 — Workflow engine.** Durable steps in SQLite; deterministic

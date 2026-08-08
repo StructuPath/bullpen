@@ -12,6 +12,7 @@ path = "src/main.rs"
 bullpen-agent.workspace = true
 bullpen-auth.workspace = true
 bullpen-harness.workspace = true
+bullpen-sandbox.workspace = true
 bullpen-llm.workspace = true
 bullpen-store.workspace = true
 bullpen-tools.workspace = true

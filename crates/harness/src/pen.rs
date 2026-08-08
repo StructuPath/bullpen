@@ -40,6 +40,9 @@ pub struct PenConfig {
     pub max_children: u64,
     pub child_timeout: Duration,
     pub child_max_turns: u32,
+    /// Write-confinement applied to work children (inspect children are
+    /// read-only regardless).
+    pub sandbox: Option<Arc<bullpen_sandbox::Sandbox>>,
 }
 
 impl PenConfig {
@@ -59,7 +62,13 @@ impl PenConfig {
             max_children: 20,
             child_timeout: Duration::from_secs(900),
             child_max_turns: 200,
+            sandbox: None,
         }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<bullpen_sandbox::Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 }
 
@@ -240,12 +249,14 @@ impl Tool for PenTool {
                 .map_err(|e| ToolError::Failed(format!("store: {e}")))?,
             &child_id,
         );
+        let mut child_ctx = ToolCtx::new(self.config.workspace.clone());
+        if let Some(sandbox) = &self.config.sandbox {
+            child_ctx = child_ctx.with_sandbox(sandbox.clone());
+        }
         let mut agent = Agent::new(
             self.provider.clone(),
             registry,
-            ToolCtx {
-                workspace: self.config.workspace.clone(),
-            },
+            child_ctx,
             AgentConfig {
                 model: self.config.model.clone(),
                 system,
@@ -302,9 +313,7 @@ mod tests {
     }
 
     fn tool_ctx() -> ToolCtx {
-        ToolCtx {
-            workspace: std::env::temp_dir(),
-        }
+        ToolCtx::new(std::env::temp_dir())
     }
 
     #[test]

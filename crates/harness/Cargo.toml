@@ -9,6 +9,7 @@ bullpen-agent.workspace = true
 bullpen-llm.workspace = true
 bullpen-store.workspace = true
 bullpen-tools.workspace = true
+bullpen-sandbox.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bullpen-llm.workspace = true
+bullpen-sandbox.workspace = true
 async-trait.workspace = true
 globset.workspace = true
 ignore.workspace = true

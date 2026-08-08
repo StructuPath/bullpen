@@ -15,20 +15,29 @@ subagents, OS sandboxing, and the workflow engine are on the
 cargo install --path crates/cli
 
 # Pick your provider(s):
-export ANTHROPIC_API_KEY=sk-ant-...   # anthropic (default)
+export ANTHROPIC_API_KEY=sk-ant-...   # anthropic (default), streams live
 bullpen login openrouter              # OpenRouter, official OAuth PKCE
 bullpen login codex                   # ChatGPT subscription, device-code flow
+export GLM_API_KEY=...                # GLM (Z.ai), Anthropic-compatible
+export KIMI_API_KEY=...               # Kimi (Moonshot), Anthropic-compatible
 # ...or skip codex login entirely: bullpen borrows a logged-in Codex CLI's
 # session (~/.codex/auth.json) read-only.
 
 cd your-project
 bullpen run "find the failing test, explain why it fails"
 bullpen run -p codex "..."            # ChatGPT subscription
-bullpen run -p openrouter -m "anthropic/claude-sonnet-4.5" "..."
-bullpen run -v "..."                  # show tool activity
+bullpen run -p glm "..."              # or -p kimi, -p openrouter
+bullpen run --sandbox "refactor X"    # confine writes to the workspace (Seatbelt on macOS)
+bullpen run -v "..."                  # show tool activity on stderr
 bullpen sessions                      # list stored sessions
 bullpen run -r <id-prefix> "follow-up question"   # resumes with the session's provider
 ```
+
+Providers: **anthropic** (true token streaming + prompt caching), **codex**
+(ChatGPT subscription), **openrouter**, **glm**, **kimi**. `--sandbox`
+confines file writes to the workspace on every platform and, on macOS, runs
+shell commands under Seatbelt so arbitrary code can't escape either;
+`--sandbox-strict` also cuts network.
 
 Sessions persist in `~/.bullpen/bullpen.db` (SQLite, WAL) as an append-only
 entry tree plus an execution log — every step of a run is durable the moment

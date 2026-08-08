@@ -50,9 +50,14 @@ impl Tool for Bash {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
-        let child = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
+        // Under a sandbox, the command (and its children) run confined to the
+        // workspace via the OS mechanism; otherwise plain bash.
+        let (program, args) = match &ctx.sandbox {
+            Some(sb) => sb.wrap_bash(command),
+            None => ("bash".to_string(), vec!["-c".to_string(), command.to_string()]),
+        };
+        let child = tokio::process::Command::new(program)
+            .args(args)
             .current_dir(&ctx.workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -98,9 +103,7 @@ mod tests {
     use super::*;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            workspace: std::env::temp_dir(),
-        }
+        ToolCtx::new(std::env::temp_dir())
     }
 
     #[tokio::test]

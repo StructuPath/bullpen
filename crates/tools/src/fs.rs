@@ -97,6 +97,7 @@ impl Tool for WriteFile {
     async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
         let path = resolve_path(ctx, required_str(&input, "path")?);
         let content = required_str(&input, "content")?;
+        ctx.check_write(&path)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -142,6 +143,7 @@ impl Tool for EditFile {
         if old.is_empty() {
             return Err(ToolError::InvalidInput("old_string must not be empty".into()));
         }
+        ctx.check_write(&path)?;
 
         let text = tokio::fs::read_to_string(&path)
             .await
@@ -172,9 +174,7 @@ mod tests {
     use super::*;
 
     fn ctx(dir: &tempfile::TempDir) -> ToolCtx {
-        ToolCtx {
-            workspace: dir.path().to_path_buf(),
-        }
+        ToolCtx::new(dir.path().to_path_buf())
     }
 
     #[tokio::test]
@@ -224,6 +224,26 @@ mod tests {
             .unwrap();
         let out = ReadFile.run(&c, "t", json!({"path": "f.txt"})).await.unwrap();
         assert!(out.contains("x = 2"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_blocks_write_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = std::sync::Arc::new(bullpen_sandbox::Sandbox::workspace(dir.path()));
+        let c = ToolCtx::new(dir.path()).with_sandbox(sandbox);
+
+        // Inside the workspace: allowed.
+        WriteFile
+            .run(&c, "t", json!({"path": "ok.txt", "content": "hi"}))
+            .await
+            .unwrap();
+
+        // Absolute path outside the workspace: refused in-process.
+        let err = WriteFile
+            .run(&c, "t", json!({"path": "/etc/bullpen-escape", "content": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sandbox"), "{err}");
     }
 
     #[tokio::test]

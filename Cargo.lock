@@ -136,6 +136,7 @@ dependencies = [
  "bullpen-auth",
  "bullpen-harness",
  "bullpen-llm",
+ "bullpen-sandbox",
  "bullpen-store",
  "bullpen-tools",
  "clap",
@@ -184,6 +185,7 @@ dependencies = [
  "async-trait",
  "bullpen-agent",
  "bullpen-llm",
+ "bullpen-sandbox",
  "bullpen-store",
  "bullpen-tools",
  "serde_json",
@@ -207,6 +209,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bullpen-sandbox"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bullpen-store"
 version = "0.1.0"
 dependencies = [
@@ -225,6 +235,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bullpen-llm",
+ "bullpen-sandbox",
  "globset",
  "ignore",
  "regex",

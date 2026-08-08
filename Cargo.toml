@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/auth",
+    "crates/sandbox",
     "crates/llm",
     "crates/tools",
     "crates/agent",
@@ -43,6 +44,7 @@ bullpen-tools = { path = "crates/tools" }
 bullpen-agent = { path = "crates/agent" }
 bullpen-store = { path = "crates/store" }
 bullpen-harness = { path = "crates/harness" }
+bullpen-sandbox = { path = "crates/sandbox" }
 
 [profile.release]
 lto = "thin"

@@ -24,6 +24,34 @@ use serde_json::Value;
 pub struct ToolCtx {
     /// Workspace root. Relative paths in tool inputs resolve against this.
     pub workspace: PathBuf,
+    /// Optional write-confinement boundary. When set, `bash` runs under it
+    /// and the file-editing tools refuse writes it disallows.
+    pub sandbox: Option<Arc<bullpen_sandbox::Sandbox>>,
+}
+
+impl ToolCtx {
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            sandbox: None,
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<bullpen_sandbox::Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// Reject a write the sandbox disallows. No sandbox → all writes allowed.
+    pub(crate) fn check_write(&self, path: &Path) -> Result<(), ToolError> {
+        match &self.sandbox {
+            Some(sb) if !sb.allows_write(path) => Err(ToolError::Failed(format!(
+                "sandbox: writing outside the workspace is not permitted: {}",
+                path.display()
+            ))),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

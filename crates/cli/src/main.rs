@@ -46,6 +46,15 @@ enum Command {
         /// Show tool activity on stderr while running.
         #[arg(short, long)]
         verbose: bool,
+        /// Confine writes to the workspace (and system temp). On macOS this
+        /// also runs shell commands under Seatbelt; elsewhere only the file
+        /// tools are confined (see --sandbox notes).
+        #[arg(long)]
+        sandbox: bool,
+        /// Like --sandbox, and also deny network access to shell commands
+        /// (macOS only). Implies --sandbox.
+        #[arg(long)]
+        sandbox_strict: bool,
     },
     /// Connect a provider account (stores credentials in ~/.bullpen).
     Login {
@@ -149,7 +158,9 @@ async fn main() -> anyhow::Result<()> {
             model,
             resume,
             verbose,
-        } => run(prompt, provider, model, resume, verbose).await,
+            sandbox,
+            sandbox_strict,
+        } => run(prompt, provider, model, resume, verbose, sandbox, sandbox_strict).await,
         Command::Login { provider, headless } => match provider {
             LoginProvider::Openrouter => login_openrouter(headless).await,
             LoginProvider::Codex => login_codex().await,
@@ -279,14 +290,32 @@ async fn login_codex() -> anyhow::Result<()> {
 
 // ── Run ─────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     prompt: String,
     provider_kind: ProviderKind,
     model: Option<String>,
     resume: Option<String>,
     verbose: bool,
+    sandbox: bool,
+    sandbox_strict: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
+
+    // Build the write-confinement sandbox, if requested.
+    let sandbox = if sandbox_strict {
+        Some(Arc::new(bullpen_sandbox::Sandbox::strict(&cwd)))
+    } else if sandbox {
+        Some(Arc::new(bullpen_sandbox::Sandbox::workspace(&cwd)))
+    } else {
+        None
+    };
+    if sandbox.is_some() && !bullpen_sandbox::Sandbox::os_enforced() {
+        eprintln!(
+            "[sandbox: OS-level shell confinement is macOS-only; on this platform \
+             only the file-editing tools are confined, not arbitrary shell commands]"
+        );
+    }
     let mut store = Store::open(&Store::default_path())?;
 
     let (session, provider_kind, model) = match &resume {
@@ -360,9 +389,10 @@ async fn run(
         }
     });
 
-    let tool_ctx = ToolCtx {
-        workspace: cwd.clone(),
-    };
+    let mut tool_ctx = ToolCtx::new(cwd.clone());
+    if let Some(sb) = &sandbox {
+        tool_ctx = tool_ctx.with_sandbox(sb.clone());
+    }
     // The journal persists every step of the run as it happens (its own
     // store handle; WAL makes the two connections safe). If the process
     // dies mid-run, the next invocation recovers from the durable state.
@@ -372,17 +402,21 @@ async fn run(
     );
     // The pen: the model can delegate bounded tasks to durable child agents
     // (sessions in the same store, resumable and listed like any other).
+    let mut pen_config = bullpen_harness::PenConfig::new(
+        Store::default_path(),
+        cwd.clone(),
+        provider_kind.name(),
+        config.model.clone(),
+        system_prompt(&cwd),
+    );
+    if let Some(sb) = &sandbox {
+        pen_config = pen_config.with_sandbox(sb.clone());
+    }
     let mut registry = Registry::standard();
     registry.register(std::sync::Arc::new(bullpen_harness::PenTool::new(
         provider.clone(),
         &session.id,
-        bullpen_harness::PenConfig::new(
-            Store::default_path(),
-            cwd.clone(),
-            provider_kind.name(),
-            config.model.clone(),
-            system_prompt(&cwd),
-        ),
+        pen_config,
     )));
     let mut agent = Agent::new(provider, registry, tool_ctx, config)
         .with_transcript(transcript, usage)
