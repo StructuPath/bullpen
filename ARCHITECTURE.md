@@ -366,9 +366,16 @@ The resume rule follows the same posture. The recorded location beats the
 directory the command was typed in; a missing directory whose branch
 survives is recreated from that branch with one stderr notice; a missing
 directory *and* missing branch is an error naming both, never a silent run
-somewhere else. `--worktree` outside a git repository is likewise an error,
-because falling back to the shared checkout would silently reintroduce
-exactly the interference the flag exists to remove.
+somewhere else. A directory that exists but is not that worktree — an
+ordinary one restored at the path, a worktree of another repository — is a
+third error rather than a fourth place to run, so the recorded path is
+checked against the session's repository, not merely stat'ed.
+`--worktree` outside a git repository is likewise an error, because falling
+back to the shared checkout would silently reintroduce exactly the
+interference the flag exists to remove. For the same reason the path and
+branch are written to the session row *before* `git worktree add` runs: a
+row pointing at a directory that failed to appear is refused on resume,
+while a row pointing at nothing would read as a plain shared-cwd session.
 
 `--sandbox` has to be widened to compose with this. A linked worktree's
 `.git` is a file; its index, refs and objects all live under the *main*
@@ -376,4 +383,9 @@ repository, outside the worktree, so a sandbox confined to the worktree
 alone leaves an agent able to edit files and unable to stage or commit
 them — which under the rule above is fatal, since a commit is the only
 evidence that would ever justify reclaiming its directory. The run therefore
-adds the worktree's git dirs to the write roots.
+adds the worktree's git dirs to the write roots. That is the whole shared
+common directory, because git's ref store cannot be sliced by path — `git
+gc` prunes `refs/heads/bullpen/` and moves the refs into a `packed-refs`
+file at the top of it — so a sandboxed agent in a worktree can also write
+the main repository's config and hooks. Confining that needs a mechanism
+other than a path allowlist.

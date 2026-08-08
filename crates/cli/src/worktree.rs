@@ -33,10 +33,12 @@ fn worktree_dir(home: &Path, session_id: &str) -> PathBuf {
     home.join("worktrees").join(session_id)
 }
 
-/// The branch a session's worktree checks out. Run-unique because session
-/// ids are, so two concurrent dispatches can never collide on it.
+/// The branch a session's worktree checks out. The whole session id, not the
+/// short prefix the CLI prints: a truncated id is 32 bits, and two sessions
+/// that collided would name one branch, which git refuses to check out in two
+/// worktrees at once — the second dispatch would simply fail.
 pub fn branch_for(session_id: &str) -> String {
-    format!("bullpen/{}", &session_id[..8])
+    format!("bullpen/{session_id}")
 }
 
 /// The repository containing `cwd`.
@@ -120,6 +122,14 @@ fn git_worktree_add(
 /// the main repository, so a sandbox confined to the worktree alone would let
 /// an agent edit files but never stage or commit them — and a commit is the
 /// only evidence that would ever justify reclaiming its directory.
+///
+/// The whole common directory, not the session's own ref and objects: git's
+/// ref store is shared mutable state that a path allowlist cannot slice. Once
+/// `git gc` packs refs it prunes `refs/heads/bullpen/`, so the next commit has
+/// to recreate that directory under `refs/heads` — and `packed-refs` itself
+/// sits at the top of the common directory. Granting either grants every
+/// branch. The residual risk is real and unavoidable here: a sandboxed agent
+/// in a worktree can write the main repository's config and hooks.
 pub fn git_write_roots(cwd: &Path) -> Vec<PathBuf> {
     let (Some(git_dir), Some(common_dir)) = (
         rev_parse_dir(cwd, "--absolute-git-dir"),
@@ -179,33 +189,53 @@ pub enum Location {
         path: PathBuf,
         branch: String,
     },
+    /// Something that is not this session's worktree sits at the recorded
+    /// path.
+    Occupied {
+        path: PathBuf,
+        branch: String,
+    },
+}
+
+/// What stands at a session's recorded worktree path.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Candidate {
+    /// A live worktree of the session's own repository.
+    Live,
+    /// Nothing — the directory is gone.
+    Gone,
+    /// A directory, but not that worktree: an ordinary one restored at the
+    /// path, or a worktree of a different repository.
+    Foreign,
 }
 
 /// The resume decision, as a table. git and the filesystem supply only the
-/// two booleans, so every row is testable without either.
+/// [`Candidate`] and the branch bit, so every row is testable without either.
 ///
 /// A recorded worktree always wins over the caller's working directory: a
 /// `bullpen run -r <id>` typed from somewhere else must not quietly append
-/// to the session in a different tree than the one it has been editing.
-pub fn decide(recorded: Option<(&str, &str)>, dir_exists: bool, branch_exists: bool) -> Location {
+/// to the session in a different tree than the one it has been editing. By
+/// the same rule a foreign directory is refused outright rather than run in
+/// or overwritten — either would be the silent misplacement this avoids.
+pub fn decide(
+    recorded: Option<(&str, &str)>,
+    candidate: Candidate,
+    branch_exists: bool,
+) -> Location {
     let Some((path, branch)) = recorded else {
         return Location::Shared;
     };
     let path = PathBuf::from(path);
-    match (dir_exists, branch_exists) {
-        (true, _) => Location::Use(path),
-        (false, true) => Location::Recreate {
-            path,
-            branch: branch.to_string(),
-        },
-        (false, false) => Location::Fail {
-            path,
-            branch: branch.to_string(),
-        },
+    let branch = branch.to_string();
+    match (candidate, branch_exists) {
+        (Candidate::Live, _) => Location::Use(path),
+        (Candidate::Foreign, _) => Location::Occupied { path, branch },
+        (Candidate::Gone, true) => Location::Recreate { path, branch },
+        (Candidate::Gone, false) => Location::Fail { path, branch },
     }
 }
 
-/// The impure half of [`decide`]: answers its two booleans. `anchor` is the
+/// The impure half of [`decide`]: answers its two inputs. `anchor` is the
 /// session's recorded cwd — the directory it was dispatched from, which is
 /// what still points at the repository once the worktree itself is gone.
 pub fn locate(
@@ -216,10 +246,34 @@ pub fn locate(
     let Some((path, branch)) = recorded_path.zip(recorded_branch) else {
         return Location::Shared;
     };
-    let dir_exists = Path::new(path).is_dir();
-    let branch_lives =
-        !dir_exists && repo_root(anchor).is_ok_and(|root| branch_exists(&root, branch));
-    decide(Some((path, branch)), dir_exists, branch_lives)
+    let candidate = inspect(anchor, Path::new(path));
+    let branch_lives = candidate == Candidate::Gone
+        && repo_root(anchor).is_ok_and(|root| branch_exists(&root, branch));
+    decide(Some((path, branch)), candidate, branch_lives)
+}
+
+/// Whether `path` really is a worktree of the repository `anchor` sits in.
+/// `is_dir` alone would accept an ordinary directory left at the recorded
+/// path — running there is the silent misplacement the recording exists to
+/// prevent — so both the shared git directory and the worktree's own top
+/// level have to agree.
+fn inspect(anchor: &Path, path: &Path) -> Candidate {
+    if !path.is_dir() {
+        return Candidate::Gone;
+    }
+    let same_repo = rev_parse_dir(path, "--git-common-dir")
+        .zip(rev_parse_dir(anchor, "--git-common-dir"))
+        .is_some_and(|(candidate, anchor)| candidate == anchor);
+    let is_top_level = repo_root(path).is_ok_and(|top| canonical(&top) == canonical(path));
+    if same_repo && is_top_level {
+        Candidate::Live
+    } else {
+        Candidate::Foreign
+    }
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -250,8 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn branch_name_is_derived_from_the_session_id_prefix() {
-        assert_eq!(branch_for(ID), "bullpen/01234567");
+    fn branch_name_carries_the_whole_session_id_not_the_short_prefix() {
+        assert_eq!(branch_for(ID), format!("bullpen/{ID}"));
+        assert_ne!(
+            branch_for("0123456789abcdef00000000deadbeef"),
+            branch_for("0123456789abcdef11111111deadbeef")
+        );
     }
 
     #[test]
@@ -264,13 +322,13 @@ mod tests {
 
     #[test]
     fn decide_falls_back_to_the_shared_cwd_only_when_nothing_was_recorded() {
-        assert_eq!(decide(None, false, false), Location::Shared);
+        assert_eq!(decide(None, Candidate::Gone, false), Location::Shared);
     }
 
     #[test]
-    fn decide_uses_the_recorded_directory_when_it_still_exists() {
+    fn decide_uses_the_recorded_directory_when_it_is_still_that_worktree() {
         assert_eq!(
-            decide(Some(("/w/a", "bullpen/a")), true, false),
+            decide(Some(("/w/a", "bullpen/a")), Candidate::Live, false),
             Location::Use(PathBuf::from("/w/a"))
         );
     }
@@ -278,7 +336,7 @@ mod tests {
     #[test]
     fn decide_recreates_from_the_branch_when_only_the_directory_is_gone() {
         assert_eq!(
-            decide(Some(("/w/a", "bullpen/a")), false, true),
+            decide(Some(("/w/a", "bullpen/a")), Candidate::Gone, true),
             Location::Recreate {
                 path: PathBuf::from("/w/a"),
                 branch: "bullpen/a".into(),
@@ -289,8 +347,19 @@ mod tests {
     #[test]
     fn missing_branch_fails_rather_than_falling_back_to_the_callers_cwd() {
         assert_eq!(
-            decide(Some(("/w/a", "bullpen/a")), false, false),
+            decide(Some(("/w/a", "bullpen/a")), Candidate::Gone, false),
             Location::Fail {
+                path: PathBuf::from("/w/a"),
+                branch: "bullpen/a".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_foreign_directory_at_the_recorded_path_is_refused_even_with_the_branch() {
+        assert_eq!(
+            decide(Some(("/w/a", "bullpen/a")), Candidate::Foreign, true),
+            Location::Occupied {
                 path: PathBuf::from("/w/a"),
                 branch: "bullpen/a".into(),
             }
@@ -328,6 +397,51 @@ mod tests {
         std::fs::remove_dir_all(&path).unwrap();
         recreate(&root, &path, "bullpen/s1").unwrap();
         assert!(path.join("f.txt").is_file());
+    }
+
+    #[test]
+    fn locate_accepts_only_a_real_worktree_of_the_sessions_own_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init_repo(&root);
+        let path = dir.path().join("worktrees").join("s1");
+        create(&root, &path, "bullpen/s1").unwrap();
+        let recorded = path.display().to_string();
+        let at = |anchor: &Path| locate(Some(&recorded), Some("bullpen/s1"), anchor);
+
+        assert_eq!(at(&root), Location::Use(path.clone()));
+
+        // A worktree of some other repository, at the same recorded path.
+        let other = dir.path().join("other");
+        init_repo(&other);
+        assert_eq!(
+            at(&other),
+            Location::Occupied {
+                path: path.clone(),
+                branch: "bullpen/s1".into(),
+            }
+        );
+
+        // An ordinary directory restored where the worktree used to be: the
+        // branch still exists, and it is still refused rather than run in.
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::create_dir_all(path.join("f.txt")).unwrap();
+        assert_eq!(
+            at(&root),
+            Location::Occupied {
+                path: path.clone(),
+                branch: "bullpen/s1".into(),
+            }
+        );
+
+        std::fs::remove_dir_all(&path).unwrap();
+        assert_eq!(
+            at(&root),
+            Location::Recreate {
+                path,
+                branch: "bullpen/s1".into(),
+            }
+        );
     }
 
     #[test]

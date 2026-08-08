@@ -391,8 +391,13 @@ async fn run(
             Some(root) => {
                 let path = worktree::worktree_path(&session.id);
                 let branch = worktree::branch_for(&session.id);
-                worktree::create(root, &path, &branch)?;
+                // Recorded before it is created, not after: if `git worktree
+                // add` fails the row then names a directory that does not
+                // exist, which resume refuses outright. A row naming nothing
+                // would instead resume into the shared checkout — the bug
+                // this flag exists to close.
                 store.set_worktree(&session.id, &path.display().to_string(), &branch)?;
+                worktree::create(root, &path, &branch)?;
                 Some(path)
             }
             None => None,
@@ -458,9 +463,17 @@ async fn run(
             path
         }
         worktree::Location::Fail { path, branch } => bail!(
-            "session {} ran in worktree {} on branch {branch}, and neither \
-             survives — nothing was removed by bullpen, so restore them (or \
-             start a new session) rather than running somewhere else",
+            "session {} is recorded in worktree {} on branch {branch}, and \
+             neither survives — nothing was removed by bullpen, so restore \
+             them (or start a new session) rather than running somewhere else",
+            &session.id[..8],
+            path.display()
+        ),
+        worktree::Location::Occupied { path, branch } => bail!(
+            "session {} is recorded in worktree {}, but what stands there is \
+             not that worktree — move it aside and restore the session's own \
+             from branch {branch} (or start a new session) rather than \
+             running somewhere else",
             &session.id[..8],
             path.display()
         ),

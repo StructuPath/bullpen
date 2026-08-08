@@ -96,8 +96,8 @@ quit. Quitting stops nothing.
 Plain `--bg` sessions share your checkout, so two of them edit the same
 files. `--worktree` gives a session a git worktree of its own on a
 run-unique `bullpen/<id>` branch, under `$BULLPEN_HOME/worktrees/<session>`;
-the path shows up in `bullpen sessions`, in `sessions --json`, and in the
-peek panel, and `bullpen run -r <id>` returns to it from anywhere. Outside a
+the path shows up in `bullpen sessions`, in `bullpen sessions --json`, and
+in the peek panel, and `bullpen run -r <id>` returns to it from anywhere. Outside a
 git repository the flag fails rather than quietly sharing the checkout.
 **Nothing removes a worktree or its branch** — not on success, not on
 failure, not later. A worktree can hold the only copy of what an agent did,

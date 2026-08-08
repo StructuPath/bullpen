@@ -336,9 +336,10 @@ impl Store {
         Ok(())
     }
 
-    /// Record where an isolated session runs. Written after the worktree
-    /// exists, never as part of `create_session`: a row that names a
-    /// directory git failed to create is worse than a row that names none.
+    /// Record where an isolated session runs. Written before the worktree is
+    /// created, so a failed creation leaves a row naming a directory that is
+    /// not there — which resume refuses — rather than a row naming none,
+    /// which resume would read as an ordinary shared-cwd session.
     pub fn set_worktree(
         &self,
         session_id: &str,
