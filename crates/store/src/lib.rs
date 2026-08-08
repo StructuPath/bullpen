@@ -1,6 +1,6 @@
 //! Durable local state.
 //!
-//! One SQLite database in WAL mode. Schema v3 implements the durable
+//! One SQLite database in WAL mode. Schema v6 implements the durable
 //! execution model from ARCHITECTURE.md ("Persistence and durable
 //! execution"):
 //!
@@ -62,6 +62,12 @@ pub struct Session {
     pub status: String,
     /// OS process id of the last run, for liveness checks.
     pub pid: Option<i64>,
+    /// Set when the session runs in its own git worktree; the directory the
+    /// run happens in, which outlives the process that created it.
+    pub worktree_path: Option<String>,
+    /// Set alongside `worktree_path`; the branch that worktree checks out.
+    /// It is what a lost directory can be restored from.
+    pub worktree_branch: Option<String>,
 }
 
 /// One conversation entry. `payload` holds a [`Message`] for kind
@@ -227,6 +233,15 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 6 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN worktree_path TEXT;
+                 ALTER TABLE sessions ADD COLUMN worktree_branch TEXT;
+                 PRAGMA user_version = 6;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -321,11 +336,28 @@ impl Store {
         Ok(())
     }
 
+    /// Record where an isolated session runs. Written after the worktree
+    /// exists, never as part of `create_session`: a row that names a
+    /// directory git failed to create is worse than a row that names none.
+    pub fn set_worktree(
+        &self,
+        session_id: &str,
+        path: &str,
+        branch: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET worktree_path = ?2, worktree_branch = ?3 WHERE id = ?1",
+            params![session_id, path, branch],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Session, StoreError> {
         self.conn
             .query_row(
                 "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                        created_at, updated_at, parent_session_id, status, pid
+                        created_at, updated_at, parent_session_id, status, pid,
+                        worktree_path, worktree_branch
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -339,7 +371,8 @@ impl Store {
     pub fn resolve_session(&self, prefix: &str) -> Result<Session, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                    created_at, updated_at, parent_session_id, status, pid
+                    created_at, updated_at, parent_session_id, status, pid,
+                    worktree_path, worktree_branch
              FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut matches: Vec<Session> = stmt
@@ -355,7 +388,8 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
-                    created_at, updated_at, parent_session_id, status, pid
+                    created_at, updated_at, parent_session_id, status, pid,
+                    worktree_path, worktree_branch
              FROM sessions ORDER BY updated_at DESC",
         )?;
         Ok(stmt
@@ -712,6 +746,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         parent_session_id: row.get(9)?,
         status: row.get(10)?,
         pid: row.get(11)?,
+        worktree_path: row.get(12)?,
+        worktree_branch: row.get(13)?,
     })
 }
 
@@ -913,5 +949,66 @@ mod tests {
         assert_eq!(messages[0].role, Role::User);
         assert_eq!(messages[1].role, Role::Assistant);
         assert!(store.open_run("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn migrates_v5_sessions_adding_worktree_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        // Build a v5 database by hand. Only `sessions` matters here: the v6
+        // migration touches nothing else.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session("s1").unwrap();
+        // Sessions that predate the feature are shared-cwd sessions.
+        assert_eq!(session.worktree_path, None);
+        assert_eq!(session.worktree_branch, None);
+    }
+
+    #[test]
+    fn set_worktree_round_trips_through_list_and_resolve() {
+        let (_dir, store) = store();
+        let s = store.create_session("/repo", "anthropic", "m").unwrap();
+        assert_eq!(s.worktree_path, None);
+
+        store
+            .set_worktree(&s.id, "/h/.bullpen/worktrees/s1", "bullpen/abcd1234")
+            .unwrap();
+
+        for found in [
+            store.get_session(&s.id).unwrap(),
+            store.resolve_session(&s.id[..8]).unwrap(),
+            store.list_sessions().unwrap().remove(0),
+        ] {
+            assert_eq!(
+                found.worktree_path.as_deref(),
+                Some("/h/.bullpen/worktrees/s1")
+            );
+            assert_eq!(found.worktree_branch.as_deref(), Some("bullpen/abcd1234"));
+            // The dispatch anchor is untouched: it is what still points at
+            // the repository once the worktree directory is gone.
+            assert_eq!(found.cwd, "/repo");
+        }
     }
 }

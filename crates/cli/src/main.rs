@@ -7,6 +7,7 @@
 mod agents;
 mod bg;
 mod json;
+mod worktree;
 
 use std::sync::Arc;
 
@@ -66,6 +67,12 @@ enum Command {
         /// Watch it with `bullpen agents`.
         #[arg(long)]
         bg: bool,
+        /// Give the background session its own git worktree on its own
+        /// branch, so concurrent runs cannot edit each other's files.
+        /// Requires --bg; not compatible with --resume. The worktree is
+        /// never removed automatically.
+        #[arg(long)]
+        worktree: bool,
     },
     /// Dispatch and monitor background sessions from one screen.
     Agents,
@@ -183,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
             sandbox,
             sandbox_strict,
             bg,
+            worktree,
         } => {
             run(
                 prompt,
@@ -194,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                 sandbox,
                 sandbox_strict,
                 bg,
+                worktree,
             )
             .await
         }
@@ -339,12 +348,31 @@ async fn run(
     sandbox: bool,
     sandbox_strict: bool,
     bg: bool,
+    worktree: bool,
 ) -> anyhow::Result<()> {
+    if worktree && !bg {
+        bail!("--worktree applies to background dispatch only; add --bg");
+    }
+    if worktree && resume.is_some() {
+        bail!(
+            "--worktree creates a worktree for a new session; a resumed one \
+             already has its location recorded"
+        );
+    }
     let cwd = std::env::current_dir()?;
 
     // Background dispatch: create/resolve the session here so we have an id to
     // hand back and to spawn a detached child against, then return.
     if bg {
+        // Resolve the repository before any state exists. A directory that
+        // is not a repository must leave behind no session row, no log file
+        // and no detached process — not a session pointing at a worktree
+        // that was never created.
+        let repo_root = if worktree {
+            Some(worktree::repo_root(&cwd)?)
+        } else {
+            None
+        };
         let store = Store::open(&Store::default_path())?;
         let session = match &resume {
             Some(prefix) => store.resolve_session(prefix)?,
@@ -359,12 +387,28 @@ async fn run(
         } else if sandbox {
             extra.push("--sandbox".to_string());
         }
+        let worktree_at = match &repo_root {
+            Some(root) => {
+                let path = worktree::worktree_path(&session.id);
+                let branch = worktree::branch_for(&session.id);
+                worktree::create(root, &path, &branch)?;
+                store.set_worktree(&session.id, &path.display().to_string(), &branch)?;
+                Some(path)
+            }
+            None => None,
+        };
         let pid = bg::spawn_detached(&session.id, &prompt, &extra)?;
         store.set_run_status(&session.id, "running", Some(pid as i64))?;
         if json {
             json::emit(&json::dispatched_json(&session.id, pid));
         } else {
             println!("dispatched {} (pid {pid})", &session.id[..8]);
+        }
+        if let Some(path) = &worktree_at {
+            eprintln!(
+                "[worktree {} — never removed automatically]",
+                path.display()
+            );
         }
         eprintln!(
             "  bullpen agents            watch it\n  bullpen logs {}          tail its output\n  bullpen run -r {} \"...\"   continue it",
@@ -374,20 +418,10 @@ async fn run(
         return Ok(());
     }
 
-    // Build the write-confinement sandbox, if requested.
-    let sandbox = if sandbox_strict {
-        Some(Arc::new(bullpen_sandbox::Sandbox::strict(&cwd)))
-    } else if sandbox {
-        Some(Arc::new(bullpen_sandbox::Sandbox::workspace(&cwd)))
-    } else {
-        None
-    };
-    if sandbox.is_some() && !bullpen_sandbox::Sandbox::os_enforced() {
-        eprintln!(
-            "[sandbox: OS-level shell confinement is macOS-only; on this platform \
-             only the file-editing tools are confined, not arbitrary shell commands]"
-        );
-    }
+    // The session is resolved before the sandbox is built: an isolated
+    // session's working directory is recorded on its row, and it is that
+    // directory the sandbox must confine — not the one the caller happened
+    // to type the command in.
     let mut store = Store::open(&Store::default_path())?;
 
     let (session, provider_kind, model) = match &resume {
@@ -405,6 +439,48 @@ async fn run(
             (session, provider_kind, model)
         }
     };
+
+    // A recorded worktree wins over the caller's cwd. This is the only
+    // mechanism that places a run: the detached background child is a
+    // `run --resume` and arrives here too, as does a resume typed by hand
+    // from anywhere.
+    let cwd = match worktree::locate(
+        session.worktree_path.as_deref(),
+        session.worktree_branch.as_deref(),
+        std::path::Path::new(&session.cwd),
+    ) {
+        worktree::Location::Shared => cwd,
+        worktree::Location::Use(path) => path,
+        worktree::Location::Recreate { path, branch } => {
+            let root = worktree::repo_root(std::path::Path::new(&session.cwd))?;
+            worktree::recreate(&root, &path, &branch)?;
+            eprintln!("[recreated worktree {} from {branch}]", path.display());
+            path
+        }
+        worktree::Location::Fail { path, branch } => bail!(
+            "session {} ran in worktree {} on branch {branch}, and neither \
+             survives — nothing was removed by bullpen, so restore them (or \
+             start a new session) rather than running somewhere else",
+            &session.id[..8],
+            path.display()
+        ),
+    };
+
+    // Build the write-confinement sandbox, if requested.
+    let sandbox = (sandbox || sandbox_strict).then(|| {
+        let base = if sandbox_strict {
+            bullpen_sandbox::Sandbox::strict(&cwd)
+        } else {
+            bullpen_sandbox::Sandbox::workspace(&cwd)
+        };
+        Arc::new(base.allowing_writes(worktree::git_write_roots(&cwd)))
+    });
+    if sandbox.is_some() && !bullpen_sandbox::Sandbox::os_enforced() {
+        eprintln!(
+            "[sandbox: OS-level shell confinement is macOS-only; on this platform \
+             only the file-editing tools are confined, not arbitrary shell commands]"
+        );
+    }
 
     // Recover any run a previous process left open, then rebuild the
     // transcript from the durable entry tree.
@@ -598,6 +674,8 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
                 "parent_session_id": s.parent_session_id,
                 "status": s.status,
                 "pid": s.pid,
+                "worktree_path": s.worktree_path,
+                "worktree_branch": s.worktree_branch,
             })
         })
         .collect()
@@ -622,8 +700,12 @@ fn sessions(json: bool) -> anyhow::Result<()> {
             Some(parent) => format!(" └ child of {}", &parent[..8]),
             None => String::new(),
         };
+        let worktree_marker = match &s.worktree_path {
+            Some(path) => format!("  [worktree {path}]"),
+            None => String::new(),
+        };
         println!(
-            "{}  {}  {:<10}  {:>6}/{:<6}  {}{}",
+            "{}  {}  {:<10}  {:>6}/{:<6}  {}{}{}",
             &s.id[..8],
             s.updated_at,
             s.provider,
@@ -635,6 +717,7 @@ fn sessions(json: bool) -> anyhow::Result<()> {
                 &s.title
             },
             child_marker,
+            worktree_marker,
         );
     }
     Ok(())
@@ -671,6 +754,8 @@ mod tests {
             parent_session_id: parent.map(|p| p.to_string()),
             status: "idle".into(),
             pid,
+            worktree_path: None,
+            worktree_branch: None,
         }
     }
 
@@ -696,8 +781,30 @@ mod tests {
                 "parent_session_id": null,
                 "status": "idle",
                 "pid": 4242,
+                "worktree_path": null,
+                "worktree_branch": null,
             }])
         );
+    }
+
+    #[test]
+    fn worktree_keys_are_null_for_shared_cwd_sessions() {
+        let rows = sessions_json(&[session("shared", None, None)]);
+        assert_eq!(rows[0]["worktree_path"], json!(null));
+        assert_eq!(rows[0]["worktree_branch"], json!(null));
+    }
+
+    #[test]
+    fn worktree_keys_carry_the_location_for_an_isolated_session() {
+        let mut s = session("isolated", None, None);
+        s.worktree_path = Some("/h/.bullpen/worktrees/isolated".into());
+        s.worktree_branch = Some("bullpen/isolated".into());
+        let rows = sessions_json(&[s]);
+        assert_eq!(
+            rows[0]["worktree_path"],
+            json!("/h/.bullpen/worktrees/isolated")
+        );
+        assert_eq!(rows[0]["worktree_branch"], json!("bullpen/isolated"));
     }
 
     #[test]
