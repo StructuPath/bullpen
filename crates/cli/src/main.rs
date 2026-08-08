@@ -70,7 +70,7 @@ enum Command {
         /// Session id or unique prefix.
         session: String,
     },
-    /// Connect a provider account (stores credentials in ~/.bullpen).
+    /// Connect a provider account (stores credentials in $BULLPEN_HOME, default ~/.bullpen).
     Login {
         #[arg(value_enum)]
         provider: LoginProvider,

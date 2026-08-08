@@ -20,6 +20,7 @@ pub mod status;
 pub use recovery::{Recovery, recover};
 pub use status::AgentStatus;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use bullpen_llm::{Message, Role, Usage};
@@ -94,6 +95,23 @@ pub struct OpenRun {
     pub records: Vec<Record>,
 }
 
+/// The directory holding bullpen's own state: `$BULLPEN_HOME` when set to a
+/// non-empty path, otherwise `~/.bullpen`.
+pub fn home_dir() -> PathBuf {
+    resolve_home(std::env::var_os("BULLPEN_HOME"), std::env::home_dir())
+}
+
+/// `bullpen_home` is `$BULLPEN_HOME` and `home` is `$HOME` (the caller reads
+/// the environment). An empty `BULLPEN_HOME` counts as unset: taken
+/// literally it would put the whole store in whatever directory the process
+/// happened to start in.
+fn resolve_home(bullpen_home: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+    match bullpen_home {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home.unwrap_or_else(|| PathBuf::from(".")).join(".bullpen"),
+    }
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -114,10 +132,7 @@ impl Store {
     }
 
     pub fn default_path() -> PathBuf {
-        std::env::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".bullpen")
-            .join("bullpen.db")
+        home_dir().join("bullpen.db")
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
@@ -723,6 +738,31 @@ mod tests {
 
     fn msg_payload(m: &Message) -> Value {
         serde_json::to_value(m).unwrap()
+    }
+
+    #[test]
+    fn unset_bullpen_home_still_resolves_under_dot_bullpen() {
+        assert_eq!(
+            resolve_home(None, Some(PathBuf::from("/h"))).join("bullpen.db"),
+            PathBuf::from("/h/.bullpen/bullpen.db")
+        );
+        // No $HOME either — the long-standing relative fallback.
+        assert_eq!(
+            resolve_home(None, None).join("bullpen.db"),
+            PathBuf::from("./.bullpen/bullpen.db")
+        );
+    }
+
+    #[test]
+    fn bullpen_home_overrides_the_default_directory() {
+        assert_eq!(
+            resolve_home(Some("/tmp/pen".into()), Some(PathBuf::from("/h"))).join("bullpen.db"),
+            PathBuf::from("/tmp/pen/bullpen.db")
+        );
+        assert_eq!(
+            resolve_home(Some("".into()), Some(PathBuf::from("/h"))).join("bullpen.db"),
+            PathBuf::from("/h/.bullpen/bullpen.db")
+        );
     }
 
     #[test]

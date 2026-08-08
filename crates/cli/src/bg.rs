@@ -14,10 +14,7 @@ pub fn log_path(session_id: &str) -> PathBuf {
 }
 
 fn logs_dir() -> PathBuf {
-    std::env::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".bullpen")
-        .join("logs")
+    bullpen_store::home_dir().join("logs")
 }
 
 /// Whether `pid` is a live process. Uses `kill(pid, 0)`: success or an
