@@ -13,6 +13,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege for every job: CI only reads the repo. Declared here rather
+# than per-job so a new job cannot silently inherit a wider repository default.
+permissions:
+  contents: read
+
 jobs:
   test:
     # Both platforms matter: bullpen-sandbox confines shell commands with
