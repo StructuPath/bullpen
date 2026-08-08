@@ -366,10 +366,14 @@ The resume rule follows the same posture. The recorded location beats the
 directory the command was typed in; a missing directory whose branch
 survives is recreated from that branch with one stderr notice; a missing
 directory *and* missing branch is an error naming both, never a silent run
-somewhere else. A directory that exists but is not that worktree — an
-ordinary one restored at the path, a worktree of another repository — is a
-third error rather than a fourth place to run, so the recorded path is
-checked against the session's repository, not merely stat'ed.
+somewhere else. Anything that exists at the path but is not that worktree —
+an ordinary directory or file restored there, a worktree of another
+repository, a second worktree of the same one on a different branch — is a
+third error rather than a fourth place to run. Proving it is the session's
+therefore takes three answers from git, not a `stat`: the shared git
+directory, the worktree's own top level, and the branch it has checked out.
+A detached HEAD passes that last one, because an interrupted rebase is the
+work retention exists for and reading it as a stranger would strand it.
 `--worktree` outside a git repository is likewise an error, because falling
 back to the shared checkout would silently reintroduce exactly the
 interference the flag exists to remove. For the same reason the path and
