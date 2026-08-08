@@ -239,20 +239,25 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   already works there); a persisted per-tool authorization model beyond the
   workspace boundary.
 - **M4 — TUI / agent view.** Stage 1 landed 2026-08-07: `bullpen agents`, a
-  daemonless dashboard for background sessions. Unlike Claude Code's agent
-  view (which needs a supervisor process because its sessions live in
-  memory), bullpen's sessions already live in the WAL store with durable
-  execution — so a background session is just a detached `bullpen run`
-  coordinating through SQLite, and the `ratatui` dashboard is a read view
-  over the store plus process-liveness checks. `bullpen run --bg` dispatches
-  a detached session; the dashboard groups sessions by derived state
-  (Working = running + live pid, Failed = running + dead pid i.e. crashed,
-  Completed, Idle), dispatches from an input line, and peeks a session's
-  latest output. `bullpen logs <id>` tails captured output. Stage 2:
-  interactive attach to a *live* process (needs a per-session control
-  socket), needs-input state (needs the approvals feature), notifications.
-  Also here eventually: the full transcript/tool-card/pen-tree view over the
-  event stream.
+  daemonless dashboard for background sessions. Claude Code's agent view
+  also persists session state to disk; its supervisor process exists for
+  worker lifecycle, IPC, prewarming, attach/reply, notifications, and
+  reconnection. The distinction is the coordination plane: bullpen has no
+  supervisor at all — a background session is just a detached `bullpen run`
+  coordinating through the SQLite WAL store, and the `ratatui` dashboard is
+  a read view over the store plus process-liveness checks, so closing it
+  stops nothing. `bullpen run --bg` dispatches a detached session; the
+  dashboard groups sessions by derived state (Working = running + live pid,
+  Failed = running + dead pid i.e. crashed, Completed, Idle), dispatches
+  from an input line, and peeks a session's latest output. `bullpen logs
+  <id>` tails captured output. Stage 2 (committed): interactive attach to a
+  *live* process (needs a per-session control socket), needs-input state
+  (needs the approvals feature), notifications. Stage 2+ candidates from
+  the same feature set, not commitments: durable queued input, stop/delete,
+  process restart, directory dispatch (choosing the working directory at
+  dispatch, beyond Stage 1's input-line dispatch), session summaries, PR
+  status. Also here eventually: the full transcript/tool-card/pen-tree view
+  over the event stream.
 - **M5 — Workflow engine.** Durable steps in SQLite; deterministic
   orchestration (sequence/fan-out/join) over pen agents; resume from any
   step. This is the layer neo has only as UI state.
