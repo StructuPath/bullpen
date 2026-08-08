@@ -246,30 +246,54 @@ pub fn locate(
     let Some((path, branch)) = recorded_path.zip(recorded_branch) else {
         return Location::Shared;
     };
-    let candidate = inspect(anchor, Path::new(path));
+    let candidate = inspect(anchor, Path::new(path), branch);
     let branch_lives = candidate == Candidate::Gone
         && repo_root(anchor).is_ok_and(|root| branch_exists(&root, branch));
     decide(Some((path, branch)), candidate, branch_lives)
 }
 
-/// Whether `path` really is a worktree of the repository `anchor` sits in.
-/// `is_dir` alone would accept an ordinary directory left at the recorded
-/// path — running there is the silent misplacement the recording exists to
-/// prevent — so both the shared git directory and the worktree's own top
-/// level have to agree.
-fn inspect(anchor: &Path, path: &Path) -> Candidate {
-    if !path.is_dir() {
+/// Whether `path` really is *this session's* worktree of the repository
+/// `anchor` sits in. `is_dir` alone would accept an ordinary directory left
+/// at the recorded path, and belonging to the right repository alone would
+/// accept a second worktree someone put there — running in either is the
+/// silent misplacement the recording exists to prevent. Gone means nothing
+/// is there at all; anything else that is there and does not answer for the
+/// session is foreign, including a plain file, which `git worktree add`
+/// would only refuse later with an error about the path.
+fn inspect(anchor: &Path, path: &Path, branch: &str) -> Candidate {
+    if std::fs::symlink_metadata(path).is_err() {
         return Candidate::Gone;
+    }
+    if !path.is_dir() {
+        return Candidate::Foreign;
     }
     let same_repo = rev_parse_dir(path, "--git-common-dir")
         .zip(rev_parse_dir(anchor, "--git-common-dir"))
         .is_some_and(|(candidate, anchor)| candidate == anchor);
     let is_top_level = repo_root(path).is_ok_and(|top| canonical(&top) == canonical(path));
-    if same_repo && is_top_level {
+    if same_repo && is_top_level && head_agrees(path, branch) {
         Candidate::Live
     } else {
         Candidate::Foreign
     }
+}
+
+/// Whether the worktree at `path` still answers for `branch`. A detached
+/// HEAD counts: an interrupted rebase or a `git checkout <sha>` the agent
+/// ran is the work this module exists to keep, and refusing to resume into
+/// it would strand exactly that. Only a different *branch* proves a
+/// different worktree.
+fn head_agrees(path: &Path, branch: &str) -> bool {
+    let Some(out) = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()
+    else {
+        return false;
+    };
+    !out.status.success() || String::from_utf8_lossy(&out.stdout).trim() == branch
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -282,25 +306,25 @@ mod tests {
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
+    /// CI runners have no global identity, and the commits below need one.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
     /// A repository at `root` with one committed file.
     fn init_repo(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
-        let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                // CI runners have no global identity, and the commit below
-                // needs one.
-                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        };
-        git(&["init"]);
+        git_in(root, &["init"]);
         std::fs::write(root.join("f.txt"), "x").unwrap();
-        git(&["add", "f.txt"]);
-        git(&["commit", "-m", "init"]);
+        git_in(root, &["add", "f.txt"]);
+        git_in(root, &["commit", "-m", "init"]);
     }
 
     #[test]
@@ -433,6 +457,38 @@ mod tests {
                 branch: "bullpen/s1".into(),
             }
         );
+
+        // A plain file, which git would otherwise only refuse later with an
+        // error about the path rather than about the session.
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, "not a worktree").unwrap();
+        assert_eq!(
+            at(&root),
+            Location::Occupied {
+                path: path.clone(),
+                branch: "bullpen/s1".into(),
+            }
+        );
+
+        // Someone else's worktree of the same repository, on another branch.
+        std::fs::remove_file(&path).unwrap();
+        git_in(
+            &root,
+            &["worktree", "add", "--force", "-b", "other", &recorded],
+        );
+        assert_eq!(
+            at(&root),
+            Location::Occupied {
+                path: path.clone(),
+                branch: "bullpen/s1".into(),
+            }
+        );
+
+        // The session's own worktree mid-rebase, or otherwise on a detached
+        // HEAD: still its own, and resumable.
+        git_in(&path, &["checkout", "--force", "bullpen/s1"]);
+        git_in(&path, &["checkout", "--detach", "HEAD"]);
+        assert_eq!(at(&root), Location::Use(path.clone()));
 
         std::fs::remove_dir_all(&path).unwrap();
         assert_eq!(
