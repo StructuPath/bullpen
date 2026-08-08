@@ -88,13 +88,18 @@ Enforced in `bullpen-agent`, tested in its unit suite:
   provider call, even after the max-turns fuse trips.
 - A `max_tokens` stop returns the partial text as a distinct error; it is
   never silently continued.
-- Tool results are capped (256 KiB) before entering the transcript.
+- Tool results are capped (256 KiB) before entering the transcript. The same
+  cap bounds tool payloads on the CLI's JSON event stream.
 
 ## Event model
 
 The loop emits `Event` values (assistant text, tool start/end, turn done) on
 an optional channel. Rendering lives entirely outside the loop — the headless
-CLI prints them; the future TUI consumes the same stream. A gone subscriber
+CLI either renders them for a human or serializes them (`run --json`, one
+object per line on stdout, terminated by a `result` object so completion is
+never inferred from EOF); the future TUI consumes the same stream. The wire
+names for the event kinds are owned by the CLI, not derived from the `Event`
+variants, so renaming a variant cannot break a consumer. A gone subscriber
 never stops the loop.
 
 ## Persistence and durable execution

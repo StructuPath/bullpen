@@ -25,8 +25,9 @@ use bullpen_llm::{
 use bullpen_tools::{Registry, ToolCtx};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Cap on any single tool result entering the transcript.
-const MAX_TOOL_RESULT_BYTES: usize = 262_144; // 256 KiB
+/// Cap on any single tool result the loop hands on — to the transcript, and
+/// to anything downstream that re-emits event payloads.
+pub const MAX_TOOL_RESULT_BYTES: usize = 262_144; // 256 KiB
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
