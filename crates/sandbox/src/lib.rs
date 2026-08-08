@@ -97,7 +97,10 @@ impl Sandbox {
                 ],
             )
         } else {
-            ("bash".to_string(), vec!["-c".to_string(), command.to_string()])
+            (
+                "bash".to_string(),
+                vec!["-c".to_string(), command.to_string()],
+            )
         }
     }
 
@@ -143,7 +146,9 @@ fn resolve_for_write(path: &Path) -> PathBuf {
     let mut tail = PathBuf::new();
     loop {
         if existing.exists() {
-            let base = existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf());
+            let base = existing
+                .canonicalize()
+                .unwrap_or_else(|_| existing.to_path_buf());
             return base.join(&tail);
         }
         match (existing.parent(), existing.file_name()) {
@@ -225,9 +230,11 @@ mod tests {
         assert!(profile.contains(&canonical.to_string_lossy().to_string()));
 
         // Non-strict allows network (no deny line).
-        assert!(!Sandbox::workspace(dir.path())
-            .seatbelt_profile()
-            .contains("(deny network*)"));
+        assert!(
+            !Sandbox::workspace(dir.path())
+                .seatbelt_profile()
+                .contains("(deny network*)")
+        );
     }
 
     #[test]

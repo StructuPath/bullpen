@@ -137,8 +137,13 @@ mod tests {
         let mut file = AuthFile::load(&path).unwrap();
         assert!(file.get("openrouter").is_none());
 
-        file.set("openrouter", Credential::ApiKey { key: "sk-or-x".into() })
-            .unwrap();
+        file.set(
+            "openrouter",
+            Credential::ApiKey {
+                key: "sk-or-x".into(),
+            },
+        )
+        .unwrap();
         file.set(
             "codex",
             Credential::Oauth {
@@ -153,7 +158,9 @@ mod tests {
         let reloaded = AuthFile::load(&path).unwrap();
         assert_eq!(
             reloaded.get("openrouter"),
-            Some(&Credential::ApiKey { key: "sk-or-x".into() })
+            Some(&Credential::ApiKey {
+                key: "sk-or-x".into()
+            })
         );
         assert!(matches!(
             reloaded.get("codex"),
@@ -168,7 +175,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut file = AuthFile::load(&path).unwrap();
-        file.set("x", Credential::ApiKey { key: "k".into() }).unwrap();
+        file.set("x", Credential::ApiKey { key: "k".into() })
+            .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }

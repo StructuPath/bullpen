@@ -121,9 +121,9 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
-        let version: i64 =
-            self.conn
-                .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
+        let version: i64 = self
+            .conn
+            .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
         if version < 1 {
             let tx = self.conn.transaction()?;
             tx.execute_batch(
@@ -404,7 +404,14 @@ impl Store {
             tx.execute(
                 "INSERT INTO entries (id, session_id, parent_id, seq, kind, payload)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![provisioned_id, session_id, parent, seq, kind, payload.to_string()],
+                params![
+                    provisioned_id,
+                    session_id,
+                    parent,
+                    seq,
+                    kind,
+                    payload.to_string()
+                ],
             )?;
             tx.execute(
                 "UPDATE lanes SET leaf_id = ?3 WHERE session_id = ?1 AND name = ?2",
@@ -448,8 +455,7 @@ impl Store {
                     parent_id: row.get(1)?,
                     seq: row.get(2)?,
                     kind: row.get(3)?,
-                    payload: serde_json::from_str(&row.get::<_, String>(4)?)
-                        .unwrap_or(Value::Null),
+                    payload: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or(Value::Null),
                 })
             })?;
             for row in rows {
@@ -460,9 +466,9 @@ impl Store {
         let mut path = Vec::new();
         let mut cursor = self.leaf(session_id)?;
         while let Some(id) = cursor {
-            let entry = by_id
-                .remove(&id)
-                .ok_or_else(|| StoreError::Corrupt(format!("leaf path references missing entry {id}")))?;
+            let entry = by_id.remove(&id).ok_or_else(|| {
+                StoreError::Corrupt(format!("leaf path references missing entry {id}"))
+            })?;
             cursor = entry.parent_id.clone();
             path.push(entry);
         }
@@ -503,7 +509,15 @@ impl Store {
             tx.execute(
                 "INSERT INTO records (id, session_id, lane, run_id, seq, kind, payload)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![id, session_id, MAIN_LANE, run_id, seq, kind, payload.to_string()],
+                params![
+                    id,
+                    session_id,
+                    MAIN_LANE,
+                    run_id,
+                    seq,
+                    kind,
+                    payload.to_string()
+                ],
             )?;
         }
         tx.commit()?;
@@ -528,7 +542,13 @@ impl Store {
             Some(id) => Value::String(id),
             None => Value::Null,
         };
-        self.append_record(session_id, &run_id.clone(), &run_id, "operation_started", &payload)?;
+        self.append_record(
+            session_id,
+            &run_id.clone(),
+            &run_id,
+            "operation_started",
+            &payload,
+        )?;
         self.conn.execute(
             "UPDATE lanes SET open_operation_id = ?3 WHERE session_id = ?1 AND name = ?2",
             params![session_id, MAIN_LANE, run_id],
@@ -715,8 +735,12 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::Text { text: "hi".into() }],
         };
-        store.append_entry(&s.id, "e1", "message", &msg_payload(&m1)).unwrap();
-        store.append_entry(&s.id, "e2", "message", &msg_payload(&m2)).unwrap();
+        store
+            .append_entry(&s.id, "e1", "message", &msg_payload(&m1))
+            .unwrap();
+        store
+            .append_entry(&s.id, "e2", "message", &msg_payload(&m2))
+            .unwrap();
 
         assert_eq!(store.leaf(&s.id).unwrap().as_deref(), Some("e2"));
         let messages = store.path_messages(&s.id).unwrap();
@@ -728,8 +752,12 @@ mod tests {
         let (_dir, mut store) = store();
         let s = store.create_session("/tmp", "anthropic", "m").unwrap();
         let payload = msg_payload(&Message::user_text("once"));
-        store.append_entry(&s.id, "e1", "message", &payload).unwrap();
-        store.append_entry(&s.id, "e1", "message", &payload).unwrap();
+        store
+            .append_entry(&s.id, "e1", "message", &payload)
+            .unwrap();
+        store
+            .append_entry(&s.id, "e1", "message", &payload)
+            .unwrap();
         assert_eq!(store.path(&s.id).unwrap().len(), 1);
 
         store
@@ -751,7 +779,9 @@ mod tests {
         let s = store.create_session("/tmp", "anthropic", "m").unwrap();
         assert!(store.open_run(&s.id).unwrap().is_none());
 
-        let run = store.start_operation(&s.id, &json!({"prompt": "go"})).unwrap();
+        let run = store
+            .start_operation(&s.id, &json!({"prompt": "go"}))
+            .unwrap();
         let open = store.open_run(&s.id).unwrap().expect("suspended");
         assert_eq!(open.run_id, run);
         assert_eq!(open.records.len(), 1);
@@ -773,11 +803,21 @@ mod tests {
         let (_dir, mut store) = store();
         let s = store.create_session("/tmp", "anthropic", "m").unwrap();
         store
-            .append_entry(&s.id, "e1", "message", &msg_payload(&Message::user_text("a")))
+            .append_entry(
+                &s.id,
+                "e1",
+                "message",
+                &msg_payload(&Message::user_text("a")),
+            )
             .unwrap();
         let run = store.start_operation(&s.id, &json!({})).unwrap();
         store
-            .append_entry(&s.id, "e2", "message", &msg_payload(&Message::user_text("b")))
+            .append_entry(
+                &s.id,
+                "e2",
+                "message",
+                &msg_payload(&Message::user_text("b")),
+            )
             .unwrap();
 
         let entry_seqs: Vec<i64> = store.path(&s.id).unwrap().iter().map(|e| e.seq).collect();

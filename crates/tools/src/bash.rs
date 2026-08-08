@@ -54,7 +54,10 @@ impl Tool for Bash {
         // workspace via the OS mechanism; otherwise plain bash.
         let (program, args) = match &ctx.sandbox {
             Some(sb) => sb.wrap_bash(command),
-            None => ("bash".to_string(), vec!["-c".to_string(), command.to_string()]),
+            None => (
+                "bash".to_string(),
+                vec!["-c".to_string(), command.to_string()],
+            ),
         };
         let child = tokio::process::Command::new(program)
             .args(args)
@@ -108,7 +111,10 @@ mod tests {
 
     #[tokio::test]
     async fn runs_and_captures_stdout() {
-        let out = Bash.run(&ctx(), "t", json!({"command": "echo hello"})).await.unwrap();
+        let out = Bash
+            .run(&ctx(), "t", json!({"command": "echo hello"}))
+            .await
+            .unwrap();
         assert_eq!(out.trim(), "hello");
     }
 
@@ -126,7 +132,11 @@ mod tests {
     #[tokio::test]
     async fn times_out() {
         let err = Bash
-            .run(&ctx(), "t", json!({"command": "sleep 5", "timeout_seconds": 1}))
+            .run(
+                &ctx(),
+                "t",
+                json!({"command": "sleep 5", "timeout_seconds": 1}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(1)));

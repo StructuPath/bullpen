@@ -219,11 +219,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .filter(|r| r.status == AgentStatus::Working)
         .count();
     let line = Line::from(vec![
-        Span::styled(" bullpen agents ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "· {} sessions · {working} working",
-            app.rows.len()
-        )),
+        Span::styled(
+            " bullpen agents ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("· {} sessions · {working} working", app.rows.len())),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -245,9 +245,17 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         let selected = i == app.selected;
         let marker = if selected { "› " } else { "  " };
         let s = &row.session;
-        let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
+        let title = if s.title.is_empty() {
+            "(untitled)"
+        } else {
+            &s.title
+        };
         let title: String = title.chars().take(48).collect();
-        let child = if s.parent_session_id.is_some() { " ↳" } else { "" };
+        let child = if s.parent_session_id.is_some() {
+            " ↳"
+        } else {
+            ""
+        };
         let text = format!(
             "{marker}{}  {:<10}  {:>6}/{:<6}  {title}{child}",
             &s.id[..8],
@@ -280,10 +288,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     let content = if app.input.is_empty() {
-        Span::styled(
-            "describe a task…",
-            Style::default().fg(Color::DarkGray),
-        )
+        Span::styled("describe a task…", Style::default().fg(Color::DarkGray))
     } else {
         Span::raw(app.input.as_str())
     };
@@ -330,7 +335,9 @@ fn draw_peek(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .title(" peek · Esc to close ");
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -402,7 +409,7 @@ mod tests {
             vec![
                 // Working, newest first
                 "work-b", "work-a", // then Failed
-                "fail", // then Completed, newest first
+                "fail",   // then Completed, newest first
                 "done-new", "done-old",
             ]
         );

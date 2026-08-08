@@ -159,8 +159,7 @@ enum LoginProvider {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -379,19 +378,15 @@ async fn run(
     let (session, provider_kind, model) = match &resume {
         Some(prefix) => {
             let session = store.resolve_session(prefix)?;
-            let kind = ProviderKind::from_name(&session.provider).with_context(|| {
-                format!("session uses unknown provider `{}`", session.provider)
-            })?;
+            let kind = ProviderKind::from_name(&session.provider)
+                .with_context(|| format!("session uses unknown provider `{}`", session.provider))?;
             let model = session.model.clone();
             (session, kind, model)
         }
         None => {
             let model = model.unwrap_or_else(|| provider_kind.default_model());
-            let session = store.create_session(
-                &cwd.display().to_string(),
-                provider_kind.name(),
-                &model,
-            )?;
+            let session =
+                store.create_session(&cwd.display().to_string(), provider_kind.name(), &model)?;
             (session, provider_kind, model)
         }
     };
@@ -432,9 +427,7 @@ async fn run(
                     eprintln!("✗ {name} failed")
                 }
                 // Assistant text streams to stdout via the delta sink below.
-                Event::AssistantText { .. }
-                | Event::ToolEnd { .. }
-                | Event::TurnDone { .. } => {}
+                Event::AssistantText { .. } | Event::ToolEnd { .. } | Event::TurnDone { .. } => {}
             }
         }
     });
@@ -457,10 +450,8 @@ async fn run(
     // The journal persists every step of the run as it happens (its own
     // store handle; WAL makes the two connections safe). If the process
     // dies mid-run, the next invocation recovers from the durable state.
-    let journal = bullpen_harness::StoreJournal::new(
-        Store::open(&Store::default_path())?,
-        &session.id,
-    );
+    let journal =
+        bullpen_harness::StoreJournal::new(Store::open(&Store::default_path())?, &session.id);
     // The pen: the model can delegate bounded tasks to durable child agents
     // (sessions in the same store, resumable and listed like any other).
     let mut pen_config = bullpen_harness::PenConfig::new(
@@ -494,7 +485,11 @@ async fn run(
     let _ = streamer.await;
 
     // Record the terminal run status for the dashboard.
-    let final_status = if result.is_ok() { "completed" } else { "failed" };
+    let final_status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
     if let Ok(store) = Store::open(&Store::default_path()) {
         let _ = store.set_run_status(&session.id, final_status, None);
     }
@@ -554,7 +549,11 @@ fn sessions() -> anyhow::Result<()> {
             s.provider,
             s.usage.input_tokens,
             s.usage.output_tokens,
-            if s.title.is_empty() { "(untitled)" } else { &s.title },
+            if s.title.is_empty() {
+                "(untitled)"
+            } else {
+                &s.title
+            },
             child_marker,
         );
     }

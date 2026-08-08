@@ -16,7 +16,10 @@ impl Pkce {
         getrandom::fill(&mut bytes).expect("os rng");
         let verifier = URL_SAFE_NO_PAD.encode(bytes);
         let challenge = challenge_s256(&verifier);
-        Self { verifier, challenge }
+        Self {
+            verifier,
+            challenge,
+        }
     }
 }
 

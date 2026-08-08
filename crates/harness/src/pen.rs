@@ -80,7 +80,11 @@ pub struct PenTool {
 }
 
 impl PenTool {
-    pub fn new(provider: Arc<dyn Provider>, parent_session: impl Into<String>, config: PenConfig) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        parent_session: impl Into<String>,
+        config: PenConfig,
+    ) -> Self {
         Self {
             provider,
             parent_session: parent_session.into(),
@@ -155,15 +159,21 @@ impl Tool for PenTool {
         // only to its own child session (WAL handles the store contention),
         // so they can run alongside each other. Work children mutate the
         // workspace and stay serial.
-        input.get("mode").and_then(Value::as_str).unwrap_or("inspect") == "inspect"
+        input
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("inspect")
+            == "inspect"
     }
 
     async fn run(&self, _ctx: &ToolCtx, call_id: &str, input: Value) -> Result<String, ToolError> {
-        let prompt = input
-            .get("prompt")
+        let prompt = input.get("prompt").and_then(Value::as_str).ok_or_else(|| {
+            ToolError::InvalidInput("missing required string field `prompt`".into())
+        })?;
+        let mode = input
+            .get("mode")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing required string field `prompt`".into()))?;
-        let mode = input.get("mode").and_then(Value::as_str).unwrap_or("inspect");
+            .unwrap_or("inspect");
         let registry = registry_for_mode(mode)?;
 
         let child_id = child_session_id(&self.parent_session, call_id);
@@ -274,7 +284,11 @@ impl Tool for PenTool {
                 "{answer}\n\n[child {short} · mode {mode} · {} in / {} out tokens{}]",
                 usage.input_tokens,
                 usage.output_tokens,
-                if recovery.is_some() { " · recovered" } else { "" },
+                if recovery.is_some() {
+                    " · recovered"
+                } else {
+                    ""
+                },
             )),
             Ok(Err(e)) => Err(ToolError::Failed(format!(
                 "child {short} failed: {e} (session is saved and resumable)"
@@ -351,9 +365,14 @@ mod tests {
 
         let store = Store::open(&dir.path().join("t.db")).unwrap();
         assert_eq!(store.count_children(&parent).unwrap(), 1);
-        let child = store.get_session(&child_session_id(&parent, "call_1")).unwrap();
+        let child = store
+            .get_session(&child_session_id(&parent, "call_1"))
+            .unwrap();
         assert_eq!(child.parent_session_id.as_deref(), Some(parent.as_str()));
-        assert_eq!(store.last_run_outcome(&child.id).unwrap().as_deref(), Some("completed"));
+        assert_eq!(
+            store.last_run_outcome(&child.id).unwrap().as_deref(),
+            Some("completed")
+        );
     }
 
     #[tokio::test]
@@ -425,7 +444,8 @@ mod tests {
                     &child_id,
                     "e-user",
                     "message",
-                    &serde_json::to_value(bullpen_llm::Message::user_text("original task")).unwrap(),
+                    &serde_json::to_value(bullpen_llm::Message::user_text("original task"))
+                        .unwrap(),
                 )
                 .unwrap();
         }
@@ -447,7 +467,10 @@ mod tests {
         let store = Store::open(&dir.path().join("t.db")).unwrap();
         let messages = store.path_messages(&child_id).unwrap();
         assert!(messages.iter().any(|m| m.text().contains("interrupted")));
-        assert_eq!(store.last_run_outcome(&child_id).unwrap().as_deref(), Some("completed"));
+        assert_eq!(
+            store.last_run_outcome(&child_id).unwrap().as_deref(),
+            Some("completed")
+        );
     }
 
     #[tokio::test]
@@ -471,7 +494,11 @@ mod tests {
         );
 
         let out = pen
-            .run(&tool_ctx(), "call_1", json!({"prompt": "task", "mode": "inspect"}))
+            .run(
+                &tool_ctx(),
+                "call_1",
+                json!({"prompt": "task", "mode": "inspect"}),
+            )
             .await
             .unwrap();
         assert!(out.contains("could not run that"), "{out}");
@@ -480,13 +507,10 @@ mod tests {
         let child_id = child_session_id(&parent, "call_1");
         let messages = store.path_messages(&child_id).unwrap();
         // The bash attempt got an unknown-tool error result, not execution.
-        assert!(
-            messages.iter().any(|m| m
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
-                    if content.contains("unknown tool")))),
-        );
+        assert!(messages.iter().any(|m| m.content.iter().any(
+            |b| matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                    if content.contains("unknown tool"))
+        )),);
     }
 
     #[tokio::test]

@@ -80,7 +80,9 @@ impl CodexAuth {
             ])
             .await?;
         // A refresh response may omit a new refresh token; keep the old one.
-        if let Credential::Oauth { refresh_token: rt, .. } = &mut credential
+        if let Credential::Oauth {
+            refresh_token: rt, ..
+        } = &mut credential
             && rt.is_empty()
         {
             *rt = refresh_token.to_string();
