@@ -28,7 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # No toolchain action: rust-toolchain.toml is the single source of the
+      # version, so CI and local builds cannot drift. Installing explicitly
+      # keeps it a visible step instead of an implicit side effect of cargo.
+      - name: Install pinned toolchain
+        run: rustup toolchain install --no-self-update
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -43,9 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install pinned toolchain
+        run: rustup toolchain install --no-self-update
 
       - uses: Swatinem/rust-cache@v2
 

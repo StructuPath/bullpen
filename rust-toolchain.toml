@@ -1,0 +1,11 @@
+# Pins the toolchain so local builds and CI compile with the same rustc.
+# rustup reads this automatically on any cargo invocation in this workspace and
+# installs the channel (with the components below) on first use — no manual
+# `rustup update` step, and no CI toolchain action needed.
+#
+# Bumping: raise `channel`, then run `cargo test --workspace` and
+# `cargo clippy --workspace --all-targets -- -D warnings` before committing.
+# A new rustc can introduce clippy lints that fail the CI gate.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
