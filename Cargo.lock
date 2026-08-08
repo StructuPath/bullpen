@@ -150,6 +150,7 @@ dependencies = [
  "libc",
  "ratatui",
  "reqwest",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]

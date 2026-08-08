@@ -19,7 +19,7 @@ use bullpen_llm::anthropic::{
 };
 use bullpen_llm::chatcompletions::{ChatCompletions, OPENROUTER_DEFAULT_MODEL};
 use bullpen_llm::codex::{Codex, DEFAULT_CODEX_MODEL};
-use bullpen_store::Store;
+use bullpen_store::{Session, Store};
 use bullpen_tools::{Registry, ToolCtx};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -80,7 +80,11 @@ enum Command {
         headless: bool,
     },
     /// List stored sessions.
-    Sessions,
+    Sessions {
+        /// Emit the list as JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -193,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
             LoginProvider::Openrouter => login_openrouter(headless).await,
             LoginProvider::Codex => login_codex().await,
         },
-        Command::Sessions => sessions(),
+        Command::Sessions { json } => sessions(json),
     }
 }
 
@@ -530,9 +534,43 @@ fn logs(prefix: &str) -> anyhow::Result<()> {
     }
 }
 
-fn sessions() -> anyhow::Result<()> {
+/// The `--json` wire shape, owned by the CLI rather than derived on
+/// `bullpen_store::Session` so the store stays free of presentation concerns.
+/// Pure so it can be tested without a store on disk.
+fn sessions_json(sessions: &[Session]) -> serde_json::Value {
+    sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "title": s.title,
+                "cwd": s.cwd,
+                "provider": s.provider,
+                "model": s.model,
+                "usage": {
+                    "input_tokens": s.usage.input_tokens,
+                    "output_tokens": s.usage.output_tokens,
+                },
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+                "parent_session_id": s.parent_session_id,
+                "status": s.status,
+                "pid": s.pid,
+            })
+        })
+        .collect()
+}
+
+fn sessions(json: bool) -> anyhow::Result<()> {
     let store = Store::open(&Store::default_path())?;
     let sessions = store.list_sessions()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&sessions_json(&sessions))?
+        );
+        return Ok(());
+    }
     if sessions.is_empty() {
         println!("no sessions yet — start one with `bullpen run \"...\"`");
         return Ok(());
@@ -570,4 +608,68 @@ fn system_prompt(cwd: &std::path::Path) -> String {
          around it silently.",
         cwd.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bullpen_llm::Usage;
+    use serde_json::json;
+
+    fn session(id: &str, parent: Option<&str>, pid: Option<i64>) -> Session {
+        Session {
+            id: id.to_string(),
+            title: String::new(),
+            cwd: "/tmp".into(),
+            provider: "codex".into(),
+            model: "m".into(),
+            usage: Usage::default(),
+            created_at: "2026-08-07 09:00".into(),
+            updated_at: "2026-08-07 09:00".into(),
+            parent_session_id: parent.map(|p| p.to_string()),
+            status: "idle".into(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn empty_session_list_serializes_to_empty_array() {
+        assert_eq!(sessions_json(&[]), json!([]));
+    }
+
+    #[test]
+    fn json_emits_the_full_session_id_not_the_display_prefix() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            sessions_json(&[session(id, None, Some(4242))]),
+            json!([{
+                "id": id,
+                "title": "",
+                "cwd": "/tmp",
+                "provider": "codex",
+                "model": "m",
+                "usage": { "input_tokens": 0, "output_tokens": 0 },
+                "created_at": "2026-08-07 09:00",
+                "updated_at": "2026-08-07 09:00",
+                "parent_session_id": null,
+                "status": "idle",
+                "pid": 4242,
+            }])
+        );
+    }
+
+    #[test]
+    fn parent_session_id_is_null_for_top_level_and_a_string_for_children() {
+        let rows = sessions_json(&[
+            session("parent", None, None),
+            session("child", Some("parent"), None),
+        ]);
+        let parents: Vec<&serde_json::Value> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| &r["parent_session_id"])
+            .collect();
+        assert_eq!(parents, vec![&json!(null), &json!("parent")]);
+    }
 }

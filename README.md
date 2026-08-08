@@ -30,6 +30,7 @@ bullpen run -p glm "..."              # or -p kimi, -p openrouter
 bullpen run --sandbox "refactor X"    # confine writes to the workspace (Seatbelt on macOS)
 bullpen run -v "..."                  # show tool activity on stderr
 bullpen sessions                      # list stored sessions
+bullpen sessions --json               # machine-readable session list
 bullpen run -r <id-prefix> "follow-up question"   # resumes with the session's provider
 
 # Dispatch and watch many background sessions from one screen:
