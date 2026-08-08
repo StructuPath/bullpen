@@ -40,9 +40,11 @@ full Agent View feature list from the same docs.
 - **The differentiator is supervisorless coordination, not durability.** Both
   systems persist session state. What bullpen uniquely lacks is a supervisor:
   a background session is a detached `bullpen run` process, the SQLite WAL
-  store is the only coordination plane, and the dashboard is a read view —
-  there is no process whose death loses attach/notification/lifecycle
-  capability. Write the comparison on that axis.
+  store is the only coordination plane, and the dashboard reads that store
+  (and can dispatch) without supervising anything — there is no central
+  supervisor whose death stops or strands detached sessions. Each session
+  still depends on its own process; the WAL store is what lets it resume.
+  Write the comparison on that axis.
 - **Checklist items enter as labeled candidates, not commitments.** The doc's
   roadmap style is deliberately minimal ("second provider adapter when
   genuinely needed, not before"). Items beyond the already-committed Stage 2

@@ -244,15 +244,17 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   worker lifecycle, IPC, prewarming, attach/reply, notifications, and
   reconnection. The distinction is the coordination plane: bullpen has no
   supervisor at all — a background session is just a detached `bullpen run`
-  coordinating through the SQLite WAL store, and the `ratatui` dashboard is
-  a read view over the store plus process-liveness checks, so closing it
+  coordinating through the SQLite WAL store, and the `ratatui` dashboard
+  reads the store plus process-liveness checks and can dispatch new
+  sessions, but never supervises or stops running ones — so closing it
   stops nothing. `bullpen run --bg` dispatches a detached session; the
   dashboard groups sessions by derived state (Working = running + live pid,
   Failed = running + dead pid i.e. crashed, Completed, Idle), dispatches
   from an input line, and peeks a session's latest output. `bullpen logs
-  <id>` tails captured output. Stage 2 (committed): interactive attach to a
-  *live* process (needs a per-session control socket), needs-input state
-  (needs the approvals feature), notifications. Stage 2+ candidates from
+  <id>` tails captured output. Stage 2 (committed): interactive attach to
+  and detach from a *live* process, leaving it running (needs a per-session
+  control socket), needs-input state (needs the approvals feature),
+  notifications. Stage 2+ candidates from
   the same feature set, not commitments: durable queued input, stop/delete,
   process restart, directory dispatch (choosing the working directory at
   dispatch, beyond Stage 1's input-line dispatch), session summaries, PR
