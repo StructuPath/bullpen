@@ -26,7 +26,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No toolchain action: rust-toolchain.toml is the single source of the
       # version, so CI and local builds cannot drift. Installing explicitly
@@ -45,7 +45,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
         run: rustup toolchain install --no-self-update
