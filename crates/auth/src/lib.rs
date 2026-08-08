@@ -3,8 +3,8 @@
 //! Two credential shapes cover every supported provider: plain API keys
 //! (OpenRouter, and later GLM/Kimi/Anthropic) and OAuth token sets with
 //! refresh (ChatGPT/Codex). Everything lives in `~/.bullpen/auth.json` (or
-//! `$BULLPEN_HOME/auth.json` when that is set), written atomically with mode
-//! 0600.
+//! `$BULLPEN_HOME/auth.json` when that is set to a non-empty path), written
+//! atomically with mode 0600.
 //!
 //! This crate also implements `bullpen_llm::codex::TokenSource` twice:
 //! [`codex::StoredCodex`] (bullpen's own login, refreshes and persists) and

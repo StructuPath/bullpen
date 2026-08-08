@@ -95,8 +95,8 @@ pub struct OpenRun {
     pub records: Vec<Record>,
 }
 
-/// The directory holding bullpen's own state: `$BULLPEN_HOME` when set,
-/// otherwise `~/.bullpen`.
+/// The directory holding bullpen's own state: `$BULLPEN_HOME` when set to a
+/// non-empty path, otherwise `~/.bullpen`.
 pub fn home_dir() -> PathBuf {
     resolve_home(std::env::var_os("BULLPEN_HOME"), std::env::home_dir())
 }
