@@ -10,9 +10,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use futures::StreamExt;
+
 use crate::retry;
 use crate::{
-    ContentBlock, Provider, ProviderError, Request, Response, StopReason, ToolSpec, Usage,
+    ContentBlock, Provider, ProviderError, Request, Response, StopReason, TextSink, ToolSpec, Usage,
 };
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -45,6 +47,9 @@ pub struct Anthropic {
     auth: AuthStyle,
     /// Whether to advertise prompt-cache breakpoints on the wire.
     caching: bool,
+    /// Whether real SSE streaming is used; off for compatible endpoints
+    /// whose streaming shape isn't confirmed (they buffer instead).
+    streaming: bool,
 }
 
 impl Anthropic {
@@ -59,6 +64,7 @@ impl Anthropic {
             base_url: API_URL.to_string(),
             auth: AuthStyle::XApiKey,
             caching: true,
+            streaming: true,
         }
     }
 
@@ -67,6 +73,7 @@ impl Anthropic {
         let mut p = Self::new(api_key);
         p.name = "glm";
         p.base_url = GLM_URL.to_string();
+        p.streaming = false;
         // Z.ai's Anthropic endpoint accepts x-api-key; caching semantics are
         // not guaranteed, so it stays off until confirmed.
         p.caching = false;
@@ -79,6 +86,7 @@ impl Anthropic {
         p.name = "kimi";
         p.base_url = KIMI_URL.to_string();
         p.auth = AuthStyle::Bearer;
+        p.streaming = false;
         p.caching = false;
         p
     }
@@ -152,6 +160,233 @@ impl Provider for Anthropic {
                 }
             }
         }
+    }
+
+    async fn complete_streaming(
+        &self,
+        req: &Request,
+        deltas: &TextSink,
+    ) -> Result<Response, ProviderError> {
+        if !self.streaming {
+            // Compatible endpoints whose SSE shape isn't confirmed: buffer,
+            // then emit the whole text as one delta (the trait default).
+            let response = self.complete(req).await?;
+            for block in &response.content {
+                if let ContentBlock::Text { text } = block {
+                    let _ = deltas.send(text.clone());
+                }
+            }
+            return Ok(response);
+        }
+
+        let mut body = to_wire(req, self.caching);
+        body["stream"] = Value::Bool(true);
+
+        // Retries apply only to establishing the stream. Once bytes flow we
+        // never retry mid-stream — a partial stream is abandoned, not
+        // persisted (see ARCHITECTURE.md "never persist partial streams").
+        let mut attempt = 0u32;
+        let resp = loop {
+            let mut builder = self
+                .client
+                .post(&self.base_url)
+                .header("anthropic-version", API_VERSION)
+                .header("accept", "text/event-stream");
+            builder = match self.auth {
+                AuthStyle::XApiKey => builder.header("x-api-key", &self.api_key),
+                AuthStyle::Bearer => builder.bearer_auth(&self.api_key),
+            };
+            match builder.json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(Duration::from_secs);
+                    if retry::retryable_status(status) && attempt + 1 < retry::MAX_ATTEMPTS {
+                        tokio::time::sleep(retry::delay(attempt, after)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    let message = resp.text().await.unwrap_or_default();
+                    return Err(ProviderError::Api { status, message });
+                }
+                Err(e) => {
+                    let transient = e.is_timeout() || e.is_connect() || e.is_request();
+                    if transient && attempt + 1 < retry::MAX_ATTEMPTS {
+                        tokio::time::sleep(retry::delay(attempt, None)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(ProviderError::Transport(e));
+                }
+            }
+        };
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut acc = StreamAccumulator::default();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(ProviderError::Transport)?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // SSE events are separated by a blank line.
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                for line in frame.lines() {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim();
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if let Ok(event) = serde_json::from_str::<Value>(data) {
+                            acc.handle(&event, deltas);
+                        }
+                    }
+                }
+            }
+        }
+        acc.finish()
+    }
+}
+
+/// Assembles a streamed Anthropic message from its SSE events. Text deltas
+/// are forwarded live; tool-call arguments arrive as partial JSON fragments
+/// accumulated per content-block index and parsed at the end.
+#[derive(Default)]
+struct StreamAccumulator {
+    blocks: Vec<StreamBlock>,
+    stop_reason: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+enum StreamBlock {
+    Text(String),
+    ToolUse { id: String, name: String, json: String },
+    Ignored,
+}
+
+impl StreamAccumulator {
+    fn handle(&mut self, event: &Value, deltas: &TextSink) {
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message_start" => {
+                if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
+                    self.input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                }
+            }
+            "content_block_start" => {
+                let block = event.get("content_block");
+                let kind = block.and_then(|b| b.get("type")).and_then(Value::as_str);
+                self.blocks.push(match kind {
+                    Some("text") => StreamBlock::Text(
+                        block
+                            .and_then(|b| b.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                    Some("tool_use") => StreamBlock::ToolUse {
+                        id: block
+                            .and_then(|b| b.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: block
+                            .and_then(|b| b.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        json: String::new(),
+                    },
+                    _ => StreamBlock::Ignored,
+                });
+            }
+            "content_block_delta" => {
+                let idx = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let delta = event.get("delta");
+                match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.and_then(|d| d.get("text")).and_then(Value::as_str)
+                        {
+                            let _ = deltas.send(text.to_string());
+                            if let Some(StreamBlock::Text(acc)) = self.blocks.get_mut(idx) {
+                                acc.push_str(text);
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let (Some(StreamBlock::ToolUse { json, .. }), Some(partial)) = (
+                            self.blocks.get_mut(idx),
+                            delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(Value::as_str),
+                        ) {
+                            json.push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(sr) = event
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    self.stop_reason = Some(sr.to_string());
+                }
+                if let Some(ot) = event
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                {
+                    self.output_tokens = ot;
+                }
+            }
+            "error" => {
+                self.stop_reason = Some("error".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> Result<Response, ProviderError> {
+        let mut content = Vec::new();
+        for block in self.blocks {
+            match block {
+                StreamBlock::Text(text) if !text.is_empty() => {
+                    content.push(ContentBlock::Text { text })
+                }
+                StreamBlock::ToolUse { id, name, json } => {
+                    let input = if json.trim().is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(&json).map_err(|e| {
+                            ProviderError::Malformed(format!("streamed tool json for {name}: {e}"))
+                        })?
+                    };
+                    content.push(ContentBlock::ToolUse { id, name, input });
+                }
+                _ => {}
+            }
+        }
+        let stop_reason = match self.stop_reason.as_deref() {
+            Some("end_turn") | Some("stop_sequence") | None => StopReason::EndTurn,
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            Some(other) => StopReason::Other(other.to_string()),
+        };
+        Ok(Response {
+            content,
+            stop_reason,
+            usage: Usage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+            },
+        })
     }
 }
 
@@ -388,6 +623,44 @@ mod tests {
         assert_eq!(cached["system"][0]["type"], "text");
         assert_eq!(cached["system"][0]["text"], "be terse");
         assert_eq!(cached["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn sse_accumulator_assembles_text_and_tool_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = StreamAccumulator::default();
+        let events = [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 12}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Look"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ing"}}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "tu_1", "name": "bash"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\":"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"ls\"}"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 7}}),
+        ];
+        for e in &events {
+            acc.handle(e, &tx);
+        }
+        let resp = acc.finish().unwrap();
+
+        // Text deltas were forwarded live, in order.
+        let mut streamed = String::new();
+        while let Ok(d) = rx.try_recv() {
+            streamed.push_str(&d);
+        }
+        assert_eq!(streamed, "Looking");
+
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+        assert_eq!(resp.usage.input_tokens, 12);
+        assert_eq!(resp.usage.output_tokens, 7);
+        assert_eq!(resp.content.len(), 2);
+        assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Looking"));
+        let ContentBlock::ToolUse { id, name, input } = &resp.content[1] else {
+            panic!("expected tool use");
+        };
+        assert_eq!((id.as_str(), name.as_str()), ("tu_1", "bash"));
+        assert_eq!(input["command"], "ls");
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub struct Agent {
     messages: Vec<Message>,
     usage: Usage,
     events: Option<UnboundedSender<Event>>,
+    delta_sink: Option<bullpen_llm::TextSink>,
     journal: Box<dyn Journal>,
 }
 
@@ -112,8 +113,16 @@ impl Agent {
             messages: Vec::new(),
             usage: Usage::default(),
             events: None,
+            delta_sink: None,
             journal: Box::new(NullJournal),
         }
+    }
+
+    /// Stream assistant-text deltas to `sink` as they are generated. Without
+    /// one, the loop uses buffered completion.
+    pub fn with_delta_sink(mut self, sink: bullpen_llm::TextSink) -> Self {
+        self.delta_sink = Some(sink);
+        self
     }
 
     /// Attach a durability journal. Without one, execution is in-memory only.
@@ -188,7 +197,10 @@ impl Agent {
                 max_tokens: self.config.max_tokens,
             };
 
-            let response = self.provider.complete(&request).await?;
+            let response = match &self.delta_sink {
+                Some(sink) => self.provider.complete_streaming(&request, sink).await?,
+                None => self.provider.complete(&request).await?,
+            };
             self.usage += response.usage;
 
             let assistant_text = response

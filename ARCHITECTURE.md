@@ -190,10 +190,18 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   PKCE) and Codex (device-code + CLI borrow) alongside Anthropic. Remaining
   from this line: GLM/Kimi as config-only Anthropic-compatible endpoints, and
   a stored-key path for Anthropic itself.
-- **M1 — Streaming + prompt caching.** SSE streaming in the Anthropic
-  adapter; cache-control breakpoints on the system block. Event stream grows
-  text deltas. (The Codex adapter already consumes SSE but buffers it;
-  incremental deltas land here too.)
+- ~~**M1 — Streaming + prompt caching.**~~ Landed 2026-08-07. `Provider`
+  grows `complete_streaming(req, &TextSink)` with a buffering default, so
+  every provider streams *something*; the Anthropic adapter implements true
+  SSE streaming (assistant text forwarded live, tool-call JSON accumulated
+  per block and parsed at `content_block_stop`, never persisting a partial
+  stream — a mid-stream failure is abandoned, not retried). Assistant text
+  streams to a `TextSink` distinct from the `Event` stream, so the CLI
+  prints tokens to stdout live while tool activity goes to stderr. Prompt
+  caching marks the system prompt as an ephemeral breakpoint. **Still
+  buffered**: Codex and OpenRouter (chat-completions) use the default —
+  incremental streaming for them is a fast follow (each needs its own SSE
+  delta parser); GLM/Kimi buffer until their SSE shape is confirmed.
 - **M2 — The pen (durable subagents).** SHIPPED 2026-08-07 (foundation +
   pen same day). The `agent` tool spawns children as sessions in the same
   store: deterministic ids (`uuidv5(parent, tool_call_id)`) make replayed

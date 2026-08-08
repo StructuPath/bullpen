@@ -329,6 +329,7 @@ async fn run(
         ..Default::default()
     };
 
+    // Tool activity (verbose only) goes to stderr.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -336,13 +337,26 @@ async fn run(
                 continue;
             }
             match event {
-                Event::AssistantText { text } => eprintln!("· {text}"),
-                Event::ToolStart { name, input, .. } => eprintln!("→ {name} {input}"),
+                Event::ToolStart { name, input, .. } => eprintln!("\n→ {name} {input}"),
                 Event::ToolEnd { name, is_error, .. } if is_error => {
                     eprintln!("✗ {name} failed")
                 }
-                Event::ToolEnd { .. } | Event::TurnDone { .. } => {}
+                // Assistant text streams to stdout via the delta sink below.
+                Event::AssistantText { .. }
+                | Event::ToolEnd { .. }
+                | Event::TurnDone { .. } => {}
             }
+        }
+    });
+
+    // Assistant text streams to stdout as it is generated.
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let streamer = tokio::spawn(async move {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        while let Some(text) = delta_rx.recv().await {
+            let _ = out.write_all(text.as_bytes());
+            let _ = out.flush();
         }
     });
 
@@ -373,20 +387,23 @@ async fn run(
     let mut agent = Agent::new(provider, registry, tool_ctx, config)
         .with_transcript(transcript, usage)
         .with_events(tx)
+        .with_delta_sink(delta_tx)
         .with_journal(Box::new(journal));
 
     let result = agent.send(&prompt).await;
     let usage = agent.usage();
-    // The agent owns the event sender; it must drop before the printer's
-    // receive loop can end, or this await never returns.
+    // The agent owns the event + delta senders; it must drop before the
+    // receive loops can end, or these awaits never return.
     drop(agent);
     let _ = printer.await;
+    let _ = streamer.await;
 
     match result {
-        Ok(answer) => {
-            println!("{answer}");
+        Ok(_) => {
+            // The answer already streamed to stdout; just close the line.
+            println!();
             eprintln!(
-                "\n[session {} · {} · {} in / {} out tokens]",
+                "[session {} · {} · {} in / {} out tokens]",
                 &session.id[..8],
                 provider_kind.name(),
                 usage.input_tokens,
@@ -394,7 +411,10 @@ async fn run(
             );
             Ok(())
         }
-        Err(e) => bail!("agent error (session {} saved): {e}", &session.id[..8]),
+        Err(e) => {
+            println!();
+            bail!("agent error (session {} saved): {e}", &session.id[..8])
+        }
     }
 }
 

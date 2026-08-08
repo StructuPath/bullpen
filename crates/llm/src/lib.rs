@@ -157,8 +157,34 @@ pub enum ProviderError {
     Failure(String),
 }
 
+/// Incremental assistant-text output. Providers send text fragments as they
+/// arrive; tool calls are still assembled and returned in the final response.
+/// A gone receiver never stops generation.
+pub type TextSink = tokio::sync::mpsc::UnboundedSender<String>;
+
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Buffered completion: the whole response arrives at once.
     async fn complete(&self, req: &Request) -> Result<Response, ProviderError>;
+
+    /// Streaming completion: assistant text is sent to `deltas` as it is
+    /// generated, and the fully assembled response is returned at the end.
+    /// The default buffers via [`Provider::complete`] and emits the final
+    /// text as one delta, so every provider streams *something* even before
+    /// it implements true streaming.
+    async fn complete_streaming(
+        &self,
+        req: &Request,
+        deltas: &TextSink,
+    ) -> Result<Response, ProviderError> {
+        let response = self.complete(req).await?;
+        for block in &response.content {
+            if let ContentBlock::Text { text } = block {
+                let _ = deltas.send(text.clone());
+            }
+        }
+        Ok(response)
+    }
 }
