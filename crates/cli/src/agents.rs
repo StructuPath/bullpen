@@ -302,34 +302,19 @@ fn draw_peek(f: &mut Frame, app: &App) {
     let area = centered(70, 60, f.area());
     f.render_widget(Clear, area);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{}  ({})", &session.id[..8], session.provider),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
     // Latest assistant text from the durable transcript.
-    match Store::open(&Store::default_path()).and_then(|s| s.path_messages(&session.id)) {
-        Ok(messages) => {
-            let latest = messages
+    let latest =
+        match Store::open(&Store::default_path()).and_then(|s| s.path_messages(&session.id)) {
+            Ok(messages) => messages
                 .iter()
                 .rev()
                 .find(|m| m.role == bullpen_llm::Role::Assistant)
                 .map(|m| m.text())
                 .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "(no output yet)".into());
-            for line in latest.lines() {
-                lines.push(Line::from(line.to_string()));
-            }
-        }
-        Err(e) => lines.push(Line::from(format!("(could not read transcript: {e})"))),
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("continue with:  bullpen run -r {} \"…\"", &session.id[..8]),
-        Style::default().fg(Color::DarkGray),
-    )));
+                .unwrap_or_else(|| "(no output yet)".into()),
+            Err(e) => format!("(could not read transcript: {e})"),
+        };
+    let lines = peek_lines(session, &latest);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -340,6 +325,34 @@ fn draw_peek(f: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// The peek panel's contents. Pure — the transcript read happens in the
+/// caller — so what the panel says about a session can be tested without a
+/// terminal or a store.
+fn peek_lines(session: &Session, latest: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{}  ({})", &session.id[..8], session.provider),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    // An isolated session's output is not in the directory the dashboard was
+    // started from, so the panel has to say where it is.
+    if let Some(path) = &session.worktree_path {
+        lines.push(Line::from(Span::styled(
+            format!("worktree {path}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    for line in latest.lines() {
+        lines.push(Line::from(line.to_string()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("continue with:  bullpen run -r {} \"…\"", &session.id[..8]),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
 }
 
 fn status_color(status: AgentStatus) -> Color {
@@ -389,9 +402,18 @@ mod tests {
                 parent_session_id: None,
                 status: "idle".into(),
                 pid: None,
+                worktree_path: None,
+                worktree_branch: None,
             },
             status,
         }
+    }
+
+    fn rendered(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
     }
 
     #[test]
@@ -413,5 +435,20 @@ mod tests {
                 "done-new", "done-old",
             ]
         );
+    }
+
+    #[test]
+    fn peek_lines_shows_the_worktree_for_an_isolated_session() {
+        let mut r = row("0123456789ab", AgentStatus::Working, "2026-08-07 10:00");
+        r.session.worktree_path = Some("/h/.bullpen/worktrees/0123456789ab".into());
+        let lines = rendered(&peek_lines(&r.session, "output"));
+        assert_eq!(lines[1], "worktree /h/.bullpen/worktrees/0123456789ab");
+    }
+
+    #[test]
+    fn peek_lines_says_nothing_about_worktrees_for_a_shared_cwd_session() {
+        let r = row("0123456789ab", AgentStatus::Working, "2026-08-07 10:00");
+        let lines = rendered(&peek_lines(&r.session, "output"));
+        assert!(!lines.iter().any(|l| l.contains("worktree")), "{lines:?}");
     }
 }

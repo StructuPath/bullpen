@@ -59,6 +59,16 @@ impl Sandbox {
         Self { caps }
     }
 
+    /// Widen the write confinement to further subtrees. Some workspaces have
+    /// machinery outside themselves that the agent legitimately writes
+    /// through — a linked git worktree's index and object store being the
+    /// case that forced this; the caller names those, since the sandbox has
+    /// no business knowing what a worktree is.
+    pub fn allowing_writes(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.caps.write_roots.extend(roots);
+        self
+    }
+
     pub fn capabilities(&self) -> &Capabilities {
         &self.caps
     }

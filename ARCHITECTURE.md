@@ -105,8 +105,12 @@ never stops the loop.
 ## Persistence and durable execution
 
 One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
-versioned by `pragma user_version`. Session ids resolve by unique prefix.
-`BULLPEN_HOME` overrides the directory (see README, "Where state lives").
+versioned by `pragma user_version` (v6). Session ids resolve by unique
+prefix. `BULLPEN_HOME` overrides the directory (see README, "Where state
+lives"). v6 added `sessions.worktree_path` / `worktree_branch`, both NULL
+for a session that shares the caller's checkout; a session's `cwd` stays the
+directory it was dispatched from, which is what still points at the
+repository when the worktree itself is gone.
 
 The durability rule, the reduction idea, and the recovery discipline below
 are adapted from pi's `harness-v2.md` design spec — see
@@ -265,6 +269,10 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   derived state (Working = running + live pid, Failed = running + dead pid
   i.e. crashed, Completed, Idle), dispatches from an input line, and peeks a
   session's latest output. `bullpen logs <id>` tails captured output.
+  `--bg --worktree` (opt-in) additionally gives a session its own git
+  worktree on a run-unique branch, so concurrent background sessions stop
+  editing each other's files; the location is recorded on the session row
+  and wins over the caller's cwd on resume (see "Worktree retention" below).
   Stage 2 (committed): interactive attach to and detach from a *live*
   process, leaving it running (needs a per-session control socket),
   needs-input state (needs the approvals feature), notifications. Stage 2+
@@ -336,3 +344,48 @@ that is still the default. Linux has no out-of-process confinement yet
 (Landlock is the intended mechanism; the in-process write check already
 works there). Do not point v0 at anything you wouldn't hand to a
 contractor's laptop.
+
+### Worktree retention (fail-closed)
+
+`--worktree` isolates a background session in its own git worktree. Nothing
+in bullpen removes that worktree or its branch — not when the run completes,
+not when it fails, not on any later invocation. The asymmetry is the whole
+argument: a leftover directory costs disk, while an eager cleanup can
+destroy the only copy of what an agent did — an uncommitted diff, an
+interrupted rebase, a file it wrote but never mentioned. Uncertainty
+retains. Even the resume path that restores a deleted worktree uses
+`git worktree add --force` rather than pruning the stale entry, because
+pruning is a removal.
+
+That constrains any future `bullpen prune`: it has to earn deletion from
+proof that the work was published — the branch is merged or pushed, the
+worktree is clean — rather than inherit an optimistic rule like age or
+session status. A `completed` session is not evidence its diff was kept.
+
+The resume rule follows the same posture. The recorded location beats the
+directory the command was typed in; a missing directory whose branch
+survives is recreated from that branch with one stderr notice; a missing
+directory *and* missing branch is an error naming both, never a silent run
+somewhere else. A directory that exists but is not that worktree — an
+ordinary one restored at the path, a worktree of another repository — is a
+third error rather than a fourth place to run, so the recorded path is
+checked against the session's repository, not merely stat'ed.
+`--worktree` outside a git repository is likewise an error, because falling
+back to the shared checkout would silently reintroduce exactly the
+interference the flag exists to remove. For the same reason the path and
+branch are written to the session row *before* `git worktree add` runs: a
+row pointing at a directory that failed to appear is refused on resume,
+while a row pointing at nothing would read as a plain shared-cwd session.
+
+`--sandbox` has to be widened to compose with this. A linked worktree's
+`.git` is a file; its index, refs and objects all live under the *main*
+repository, outside the worktree, so a sandbox confined to the worktree
+alone leaves an agent able to edit files and unable to stage or commit
+them — which under the rule above is fatal, since a commit is the only
+evidence that would ever justify reclaiming its directory. The run therefore
+adds the worktree's git dirs to the write roots. That is the whole shared
+common directory, because git's ref store cannot be sliced by path — `git
+gc` prunes `refs/heads/bullpen/` and moves the refs into a `packed-refs`
+file at the top of it — so a sandboxed agent in a worktree can also write
+the main repository's config and hooks. Confining that needs a mechanism
+other than a path allowlist.

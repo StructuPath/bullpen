@@ -83,6 +83,7 @@ bullpen run -r 6ee4acc9 "now write the fix"
 
 ```bash
 bullpen run --bg "audit the auth module"   # detached, returns immediately
+bullpen run --bg --worktree "refactor it"  # …in its own git worktree
 bullpen agents                             # the dashboard in the GIF above
 bullpen logs 6ee4acc9                      # tail a background session
 ```
@@ -91,6 +92,16 @@ bullpen logs 6ee4acc9                      # tail a background session
 **Failed** (running, dead pid — it crashed), **Completed**, **Idle** — and
 lets you dispatch from the input line, `Space` to peek at output, `Esc` to
 quit. Quitting stops nothing.
+
+Plain `--bg` sessions share your checkout, so two of them edit the same
+files. `--worktree` gives a session a git worktree of its own on a
+run-unique `bullpen/<id>` branch, under `$BULLPEN_HOME/worktrees/<session>`;
+the path shows up in `bullpen sessions`, in `bullpen sessions --json`, and
+in the peek panel, and `bullpen run -r <id>` returns to it from anywhere. Outside a
+git repository the flag fails rather than quietly sharing the checkout.
+**Nothing removes a worktree or its branch** — not on success, not on
+failure, not later. A worktree can hold the only copy of what an agent did,
+so cleaning up is yours to decide.
 
 ## The pen
 
@@ -130,8 +141,9 @@ can't be opened read-only without their shared-memory file:
 sqlite3 "file:${BULLPEN_HOME:-$HOME/.bullpen}/bullpen.db?immutable=1" "select id, status from sessions"
 ```
 
-Set `BULLPEN_HOME` to move the whole directory — database, `auth.json`, and
-background logs land directly in it, with no `.bullpen` segment appended.
+Set `BULLPEN_HOME` to move the whole directory — database, `auth.json`,
+background logs, and `--worktree` checkouts (`worktrees/<session-id>`) land
+directly in it, with no `.bullpen` segment appended.
 
 ## Status
 
