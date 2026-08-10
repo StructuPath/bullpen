@@ -8,7 +8,7 @@ Set Padding 18
 Set TypingSpeed 40ms
 
 Hide
-Type "export PS1='$ ' PATH=/Users/vics/.cargo/bin:$PATH HOME=/tmp/bpdemo/home; cd /tmp/bpdemo/work; clear"
+Type "export PS1='$ ' PATH=$HOME/.cargo/bin:$PATH BULLPEN_HOME=/tmp/bpdemo/home; cd /tmp/bpdemo/work; clear"
 Enter
 Sleep 1s
 Show
