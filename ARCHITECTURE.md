@@ -105,12 +105,13 @@ never stops the loop.
 ## Persistence and durable execution
 
 One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
-versioned by `pragma user_version` (v6). Session ids resolve by unique
+versioned by `pragma user_version` (v7). Session ids resolve by unique
 prefix. `BULLPEN_HOME` overrides the directory (see README, "Where state
 lives"). v6 added `sessions.worktree_path` / `worktree_branch`, both NULL
-for a session that shares the caller's checkout; a session's `cwd` stays the
-directory it was dispatched from, which is what still points at the
-repository when the worktree itself is gone.
+for a session that shares the caller's checkout; v7 added the transient
+`worker_generation` ownership token. A session's `cwd` stays the directory
+it was dispatched from, which is what still points at the repository when
+the worktree itself is gone.
 
 The durability rule, the reduction idea, and the recovery discipline below
 are adapted from pi's `harness-v2.md` design spec — see

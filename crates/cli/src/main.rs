@@ -21,7 +21,7 @@ use bullpen_llm::anthropic::{
 };
 use bullpen_llm::chatcompletions::{ChatCompletions, OPENROUTER_DEFAULT_MODEL};
 use bullpen_llm::codex::{Codex, DEFAULT_CODEX_MODEL};
-use bullpen_store::{Session, Store};
+use bullpen_store::{Session, SessionWorker, Store};
 use bullpen_tools::{Registry, ToolCtx};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -403,7 +403,6 @@ async fn run(
             None => None,
         };
         let pid = bg::spawn_detached(&session.id, &prompt, &extra)?;
-        store.set_run_status(&session.id, "running", Some(pid as i64))?;
         if json {
             json::emit(&json::dispatched_json(&session.id, pid));
         } else {
@@ -444,6 +443,15 @@ async fn run(
             (session, provider_kind, model)
         }
     };
+
+    // One process owns recovery, the in-memory transcript and provider calls
+    // for this session. SQLite serializes writes but cannot make two agent
+    // loops safe; the crash-released lock can.
+    let db_path = Store::default_path();
+    let mut session_worker = SessionWorker::acquire(&db_path, &session.id)?;
+    // Start lifecycle immediately after exclusive ownership. Any later setup
+    // or recovery error is then recorded as a failed run by the guard.
+    session_worker.start(&mut store)?;
 
     // A recorded worktree wins over the caller's cwd. This is the only
     // mechanism that places a run: the detached background child is a
@@ -506,9 +514,9 @@ async fn run(
         );
     }
     let usage = store.get_session(&session.id)?.usage;
-    // Mark this session as actively running under our pid, so the dashboard
-    // shows it as Working (and as a crash if this process dies mid-run).
-    store.set_run_status(&session.id, "running", Some(std::process::id() as i64))?;
+    // Only the lock-owning worker writes lifecycle state. The detached parent
+    // deliberately does not: a fast child may already have completed by the
+    // time spawn returns.
     drop(store);
 
     let provider = build_provider(provider_kind)?;
@@ -598,15 +606,15 @@ async fn run(
     let _ = printer.await;
     let _ = streamer.await;
 
-    // Record the terminal run status for the dashboard.
+    // Record the terminal state only for our persisted worker generation.
     let final_status = if result.is_ok() {
         "completed"
     } else {
         "failed"
     };
-    if let Ok(store) = Store::open(&Store::default_path()) {
-        let _ = store.set_run_status(&session.id, final_status, None);
-    }
+    session_worker
+        .finish(final_status)
+        .context("record terminal session worker status")?;
 
     // Both consumer tasks have joined, so this is provably the last line of
     // the stream. It carries the outcome outright: a consumer must never have

@@ -178,10 +178,7 @@ fn dispatch(app: &mut App, store: &Store, prompt: &str) {
         }
     };
     match crate::bg::spawn_detached(&session.id, prompt, &[]) {
-        Ok(pid) => {
-            let _ = store.set_run_status(&session.id, "running", Some(pid as i64));
-            app.refresh(store);
-        }
+        Ok(_) => app.refresh(store),
         Err(e) => app.error = Some(format!("dispatch failed: {e}")),
     }
 }

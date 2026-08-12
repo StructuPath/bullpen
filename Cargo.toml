@@ -33,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = "0.28"
 libc = "0.2"
+fs2 = "0.4"
 regex = "1"
 globset = "0.4"
 ignore = "0.4"

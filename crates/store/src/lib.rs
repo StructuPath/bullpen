@@ -1,6 +1,6 @@
 //! Durable local state.
 //!
-//! One SQLite database in WAL mode. Schema v6 implements the durable
+//! One SQLite database in WAL mode. Schema v7 implements the durable
 //! execution model from ARCHITECTURE.md ("Persistence and durable
 //! execution"):
 //!
@@ -16,9 +16,11 @@
 
 mod recovery;
 pub mod status;
+mod worker;
 
 pub use recovery::{Recovery, recover};
 pub use status::AgentStatus;
+pub use worker::{SessionWorker, WorkerError};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -142,11 +144,21 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
-        let version: i64 = self
+        let observed: i64 = self
             .conn
             .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
+        if observed >= 7 {
+            return Ok(());
+        }
+
+        // Recheck after taking the write lock. Otherwise two first opens can
+        // both observe an old version and race the same ALTER TABLE;
+        // busy_timeout cannot repair that stale migration decision.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
         if version < 1 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(
                 "CREATE TABLE sessions (
                     id            TEXT PRIMARY KEY,
@@ -167,18 +179,14 @@ impl Store {
                 );
                 PRAGMA user_version = 1;",
             )?;
-            tx.commit()?;
         }
         if version < 2 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'anthropic';
                  PRAGMA user_version = 2;",
             )?;
-            tx.commit()?;
         }
         if version < 3 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 1;
                  CREATE TABLE entries (
@@ -214,34 +222,34 @@ impl Store {
             )?;
             migrate_messages_to_entries(&tx)?;
             tx.execute_batch("DROP TABLE messages; PRAGMA user_version = 3;")?;
-            tx.commit()?;
         }
         if version < 4 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
                  PRAGMA user_version = 4;",
             )?;
-            tx.commit()?;
         }
         if version < 5 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'idle';
                  ALTER TABLE sessions ADD COLUMN pid INTEGER;
                  PRAGMA user_version = 5;",
             )?;
-            tx.commit()?;
         }
         if version < 6 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN worktree_path TEXT;
                  ALTER TABLE sessions ADD COLUMN worktree_branch TEXT;
                  PRAGMA user_version = 6;",
             )?;
-            tx.commit()?;
         }
+        if version < 7 {
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN worker_generation TEXT;
+                 PRAGMA user_version = 7;",
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -321,19 +329,50 @@ impl Store {
             }))
     }
 
-    /// Record the run status (and process id) for the dashboard.
-    pub fn set_run_status(
-        &self,
-        session_id: &str,
-        status: &str,
-        pid: Option<i64>,
-    ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE sessions SET status = ?2, pid = ?3, updated_at = datetime('now')
+    /// Mark an exclusively-owned worker as running and return its generation.
+    ///
+    /// The generation makes terminal updates conditional: a stale worker can
+    /// never overwrite a newer worker's state, even if lifecycle code is
+    /// accidentally reordered around process startup in the future.
+    pub fn start_worker(&mut self, session_id: &str, pid: i64) -> Result<String, StoreError> {
+        let generation = uuid::Uuid::new_v4().to_string();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET status = 'running', pid = ?2, worker_generation = ?3,
+                 updated_at = datetime('now')
              WHERE id = ?1",
-            params![session_id, status, pid],
+            params![session_id, pid, generation],
         )?;
-        Ok(())
+        if changed == 0 {
+            return Err(StoreError::NotFound(session_id.to_string()));
+        }
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    /// Finish a worker only if it still owns the session generation.
+    /// Returns `false` for a stale generation without mutating the session.
+    pub fn finish_worker(
+        &mut self,
+        session_id: &str,
+        generation: &str,
+        status: &str,
+    ) -> Result<bool, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET status = ?3, pid = NULL, worker_generation = NULL,
+                 updated_at = datetime('now')
+             WHERE id = ?1 AND worker_generation = ?2",
+            params![session_id, generation, status],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     /// Record where an isolated session runs. Written before the worktree is
@@ -957,7 +996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v5.db");
         // Build a v5 database by hand. Only `sessions` matters here: the v6
-        // migration touches nothing else.
+        // and v7 migrations touch nothing else.
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -985,6 +1024,121 @@ mod tests {
         // Sessions that predate the feature are shared-cwd sessions.
         assert_eq!(session.worktree_path, None);
         assert_eq!(session.worktree_branch, None);
+    }
+
+    #[test]
+    fn migrates_v6_sessions_adding_worker_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER,
+                    worktree_path TEXT,
+                    worktree_branch TEXT
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        let generation = store.start_worker("s1", 42).unwrap();
+        assert!(store.finish_worker("s1", &generation, "completed").unwrap());
+        let session = store.get_session("s1").unwrap();
+        assert_eq!(session.status, "completed");
+        assert_eq!(session.pid, None);
+    }
+
+    #[test]
+    fn concurrent_first_open_serializes_the_v7_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-v6.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER,
+                    worktree_path TEXT,
+                    worktree_branch TEXT
+                 );
+                 PRAGMA user_version = 6;
+                 PRAGMA journal_mode = WAL;",
+            )
+            .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn stale_worker_cannot_overwrite_the_current_generation() {
+        let (_dir, mut store) = store();
+        let session = store.create_session("/repo", "anthropic", "m").unwrap();
+        let stale = store.start_worker(&session.id, 11).unwrap();
+        let current = store.start_worker(&session.id, 22).unwrap();
+
+        assert!(
+            !store
+                .finish_worker(&session.id, &stale, "completed")
+                .unwrap()
+        );
+        let running = store.get_session(&session.id).unwrap();
+        assert_eq!(running.status, "running");
+        assert_eq!(running.pid, Some(22));
+
+        assert!(
+            store
+                .finish_worker(&session.id, &current, "failed")
+                .unwrap()
+        );
+        let failed = store.get_session(&session.id).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.pid, None);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use bullpen_agent::{Agent, AgentConfig};
 use bullpen_llm::{Provider, Role, ToolSpec};
-use bullpen_store::Store;
+use bullpen_store::{SessionWorker, Store};
 use bullpen_tools::{Glob, Grep, ReadFile, Registry, Tool, ToolCtx, ToolError};
 use serde_json::{Value, json};
 
@@ -229,7 +229,14 @@ impl Tool for PenTool {
             ));
         }
 
-        // Fresh or interrupted child: recover if needed, then run.
+        // Fresh or interrupted child: acquire the same exclusive ownership
+        // used by top-level CLI runs before recovery or provider activity.
+        // This prevents a manual `bullpen run -r <child>` from racing the pen.
+        let mut session_worker = SessionWorker::acquire(&self.config.store_path, &child_id)
+            .map_err(|e| ToolError::Failed(format!("child {short}: {e}")))?;
+        session_worker
+            .start(&mut store)
+            .map_err(|e| ToolError::Failed(format!("child {short}: {e}")))?;
         let (transcript, recovery) = prepare_session(&mut store, &child_id)
             .map_err(|e| ToolError::Failed(format!("store: {e}")))?;
         let task = if transcript.is_empty() {
@@ -279,7 +286,7 @@ impl Tool for PenTool {
 
         let result = tokio::time::timeout(self.config.child_timeout, agent.send(&task)).await;
         let usage = agent.usage();
-        match result {
+        let outcome = match result {
             Ok(Ok(answer)) => Ok(format!(
                 "{answer}\n\n[child {short} · mode {mode} · {} in / {} out tokens{}]",
                 usage.input_tokens,
@@ -298,7 +305,16 @@ impl Tool for PenTool {
                  recoverable — calling agent again with the same task will continue it",
                 self.config.child_timeout.as_secs()
             ))),
-        }
+        };
+        let status = if outcome.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
+        session_worker
+            .finish(status)
+            .map_err(|e| ToolError::Failed(format!("child {short}: {e}")))?;
+        outcome
     }
 }
 
@@ -369,10 +385,39 @@ mod tests {
             .get_session(&child_session_id(&parent, "call_1"))
             .unwrap();
         assert_eq!(child.parent_session_id.as_deref(), Some(parent.as_str()));
+        assert_eq!(child.status, "completed");
+        assert_eq!(child.pid, None);
         assert_eq!(
             store.last_run_outcome(&child.id).unwrap().as_deref(),
             Some("completed")
         );
+    }
+
+    #[tokio::test]
+    async fn a_cli_owned_child_cannot_also_run_in_the_pen() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = parent(&dir);
+        let child_id = child_session_id(&parent, "call_1");
+        let owner = SessionWorker::acquire(&config(&dir).store_path, &child_id).unwrap();
+        let pen = PenTool::new(FakeProvider::new(vec![]), &parent, config(&dir));
+
+        let error = pen
+            .run(&tool_ctx(), "call_1", json!({"prompt": "task"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already has a running worker"));
+
+        drop(owner);
+        let pen = PenTool::new(
+            FakeProvider::new(vec![text_response("after release")]),
+            &parent,
+            config(&dir),
+        );
+        let output = pen
+            .run(&tool_ctx(), "call_1", json!({"prompt": "task"}))
+            .await
+            .unwrap();
+        assert!(output.contains("after release"));
     }
 
     #[tokio::test]
