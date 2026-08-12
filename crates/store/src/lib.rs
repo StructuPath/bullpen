@@ -1,6 +1,6 @@
 //! Durable local state.
 //!
-//! One SQLite database in WAL mode. Schema v7 implements the durable
+//! One SQLite database in WAL mode. Schema v8 implements the durable
 //! execution model from ARCHITECTURE.md ("Persistence and durable
 //! execution"):
 //!
@@ -14,10 +14,12 @@
 //! Appends are idempotent on the caller-provisioned id, which is what makes
 //! re-running recovery safe.
 
+mod inbox;
 mod recovery;
 pub mod status;
 mod worker;
 
+pub use inbox::{SessionInput, SessionInputState};
 pub use recovery::{Recovery, recover};
 pub use status::AgentStatus;
 pub use worker::{SessionWorker, WorkerError};
@@ -147,7 +149,7 @@ impl Store {
         let observed: i64 = self
             .conn
             .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
-        if observed >= 7 {
+        if observed >= 8 {
             return Ok(());
         }
 
@@ -247,6 +249,30 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN worker_generation TEXT;
                  PRAGMA user_version = 7;",
+            )?;
+        }
+        if version < 8 {
+            tx.execute_batch(
+                "CREATE TABLE session_inputs (
+                    id           TEXT PRIMARY KEY,
+                    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    position     INTEGER NOT NULL,
+                    prompt       TEXT NOT NULL,
+                    state        TEXT NOT NULL DEFAULT 'pending'
+                                 CHECK (state IN ('pending', 'started')),
+                    operation_id TEXT,
+                    enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                    started_at   TEXT,
+                    UNIQUE (session_id, position),
+                    CHECK (
+                        (state = 'pending' AND operation_id IS NULL AND started_at IS NULL)
+                        OR
+                        (state = 'started' AND operation_id IS NOT NULL AND started_at IS NOT NULL)
+                    )
+                 );
+                 CREATE INDEX session_inputs_pending
+                    ON session_inputs(session_id, state, position);
+                 PRAGMA user_version = 8;",
             )?;
         }
         tx.commit()?;
@@ -1063,9 +1089,9 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_first_open_serializes_the_v7_migration() {
+    fn concurrent_first_open_serializes_the_v8_migration() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("concurrent-v6.db");
+        let path = dir.path().join("concurrent-v7.db");
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -1082,9 +1108,15 @@ mod tests {
                     status TEXT NOT NULL DEFAULT 'idle',
                     pid INTEGER,
                     worktree_path TEXT,
-                    worktree_branch TEXT
+                    worktree_branch TEXT,
+                    worker_generation TEXT
                  );
-                 PRAGMA user_version = 6;
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 7;
                  PRAGMA journal_mode = WAL;",
             )
             .unwrap();
@@ -1112,7 +1144,74 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_inputs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+    }
+
+    #[test]
+    fn migrates_v7_sessions_to_durable_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v7.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER,
+                    worktree_path TEXT,
+                    worktree_branch TEXT,
+                    worker_generation TEXT
+                 );
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL
+                 );
+                 CREATE TABLE lanes (
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL DEFAULT 'main', leaf_id TEXT,
+                    open_operation_id TEXT, PRIMARY KEY (session_id, name)
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 INSERT INTO lanes (session_id, name) VALUES ('s1', 'main');
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        let input = store
+            .enqueue_input(
+                "s1",
+                "input-1",
+                &msg_payload(&Message::user_text("migrated")),
+            )
+            .unwrap();
+        assert_eq!(input.position, 1);
+        assert_eq!(input.state, SessionInputState::Pending);
+        let version: i64 = store
+            .conn
+            .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
     }
 
     #[test]

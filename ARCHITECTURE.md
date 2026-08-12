@@ -105,11 +105,12 @@ never stops the loop.
 ## Persistence and durable execution
 
 One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
-versioned by `pragma user_version` (v7). Session ids resolve by unique
+versioned by `pragma user_version` (v8). Session ids resolve by unique
 prefix. `BULLPEN_HOME` overrides the directory (see README, "Where state
 lives"). v6 added `sessions.worktree_path` / `worktree_branch`, both NULL
 for a session that shares the caller's checkout; v7 added the transient
-`worker_generation` ownership token. A session's `cwd` stays the directory
+`worker_generation` ownership token; v8 added the durable ordered
+`session_inputs` inbox. A session's `cwd` stays the directory
 it was dispatched from, which is what still points at the repository when
 the worktree itself is gone.
 
@@ -131,8 +132,16 @@ tree never contains orchestration state.
 during normal execution. Records never enter model context. Deleting every
 record leaves a complete, valid conversation.
 
-Both share one per-session monotonic `seq`, allocated inside the storage
-write — callers never see or pass sequence numbers or parent ids.
+**Session inputs** are caller-idempotent prompts waiting in a durable FIFO.
+Their per-session positions are allocated under an IMMEDIATE transaction.
+Starting the oldest pending input is one atomic transaction: mark it started,
+open its linked operation, append its single user entry, and advance the lane
+pointers. Before commit it remains pending; after commit ordinary operation
+recovery owns the run and the prompt is never requeued or appended again.
+Direct runs continue to use the ordinary journal path without an inbox row.
+
+Entries and records share one per-session monotonic `seq`, allocated inside
+the storage write — callers never see or pass sequence numbers or parent ids.
 
 ### The durability rule
 

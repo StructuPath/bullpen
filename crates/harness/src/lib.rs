@@ -34,6 +34,7 @@ pub fn prepare_session(
 pub struct StoreJournal {
     store: std::sync::Mutex<Store>,
     session_id: String,
+    input_id: Option<String>,
     run_id: Option<String>,
     /// Provisioned id for the current tool batch's grouped results entry,
     /// allocated at intent time so recovery can pair intents to it.
@@ -41,10 +42,29 @@ pub struct StoreJournal {
 }
 
 impl StoreJournal {
+    /// Journal an ordinary direct run. This preserves the existing operation
+    /// start followed by user-entry append behavior.
     pub fn new(store: Store, session_id: impl Into<String>) -> Self {
         Self {
             store: std::sync::Mutex::new(store),
             session_id: session_id.into(),
+            input_id: None,
+            run_id: None,
+            pending_results_entry: None,
+        }
+    }
+
+    /// Journal a run sourced from a durable session input. `run_started`
+    /// atomically consumes it only when it is still the oldest pending input.
+    pub fn for_input(
+        store: Store,
+        session_id: impl Into<String>,
+        input_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            store: std::sync::Mutex::new(store),
+            session_id: session_id.into(),
+            input_id: Some(input_id.into()),
             run_id: None,
             pending_results_entry: None,
         }
@@ -70,18 +90,35 @@ fn jerr(e: StoreError) -> JournalError {
 impl Journal for StoreJournal {
     async fn run_started(&mut self, user: &Message) -> Result<(), JournalError> {
         let sid = self.session_id.clone();
-        let run_id = self
-            .store()
-            .start_operation(&sid, &json!({}))
-            .map_err(jerr)?;
-        self.store()
-            .append_entry(
-                &sid,
-                &uuid::Uuid::new_v4().to_string(),
-                "message",
-                &serde_json::to_value(user).map_err(|e| JournalError(e.to_string()))?,
-            )
-            .map_err(jerr)?;
+        let run_id = if let Some(input_id) = self.input_id.clone() {
+            let prompt = serde_json::to_value(user).map_err(|e| JournalError(e.to_string()))?;
+            let queued = self.store().inspect_input(&sid, &input_id).map_err(jerr)?;
+            if queued.prompt != prompt {
+                return Err(JournalError(format!(
+                    "queued input `{input_id}` does not match the run prompt"
+                )));
+            }
+            self.store()
+                .start_oldest_pending_input(&sid, &input_id)
+                .map_err(jerr)?
+                .ok_or_else(|| JournalError("no pending session input to start".into()))?
+                .operation_id
+                .ok_or_else(|| JournalError("started session input has no operation".into()))?
+        } else {
+            let run_id = self
+                .store()
+                .start_operation(&sid, &json!({}))
+                .map_err(jerr)?;
+            self.store()
+                .append_entry(
+                    &sid,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "message",
+                    &serde_json::to_value(user).map_err(|e| JournalError(e.to_string()))?,
+                )
+                .map_err(jerr)?;
+            run_id
+        };
         self.run_id = Some(run_id);
         Ok(())
     }
@@ -320,6 +357,80 @@ mod tests {
             open_store(&dir).path_messages(&session.id).unwrap().len(),
             6
         );
+    }
+
+    #[tokio::test]
+    async fn direct_store_journal_still_starts_an_ordinary_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let session = store.create_session("/tmp", "fake", "test").unwrap();
+        let mut journal = StoreJournal::new(open_store(&dir), &session.id);
+
+        journal
+            .run_started(&Message::user_text("direct"))
+            .await
+            .unwrap();
+
+        let store = open_store(&dir);
+        assert!(store.list_inputs(&session.id).unwrap().is_empty());
+        assert!(store.open_run(&session.id).unwrap().is_some());
+        let messages = store.path_messages(&session.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "direct");
+    }
+
+    #[tokio::test]
+    async fn input_store_journal_atomically_starts_the_queued_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open_store(&dir);
+        let session = store.create_session("/tmp", "fake", "test").unwrap();
+        let user = Message::user_text("queued");
+        store
+            .enqueue_input(
+                &session.id,
+                "input-1",
+                &serde_json::to_value(&user).unwrap(),
+            )
+            .unwrap();
+        let mut journal = StoreJournal::for_input(open_store(&dir), &session.id, "input-1");
+
+        journal.run_started(&user).await.unwrap();
+
+        let store = open_store(&dir);
+        let input = store.inspect_input(&session.id, "input-1").unwrap();
+        let open = store.open_run(&session.id).unwrap().unwrap();
+        assert_eq!(input.operation_id.as_deref(), Some(open.run_id.as_str()));
+        assert_eq!(store.path_messages(&session.id).unwrap(), vec![user]);
+    }
+
+    #[tokio::test]
+    async fn input_store_journal_rejects_a_different_prompt_without_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open_store(&dir);
+        let session = store.create_session("/tmp", "fake", "test").unwrap();
+        store
+            .enqueue_input(
+                &session.id,
+                "input-1",
+                &serde_json::to_value(Message::user_text("queued")).unwrap(),
+            )
+            .unwrap();
+        let mut journal = StoreJournal::for_input(open_store(&dir), &session.id, "input-1");
+
+        assert!(
+            journal
+                .run_started(&Message::user_text("other"))
+                .await
+                .is_err()
+        );
+
+        let store = open_store(&dir);
+        assert_eq!(
+            store.inspect_input(&session.id, "input-1").unwrap().state,
+            bullpen_store::SessionInputState::Pending
+        );
+        assert!(store.open_run(&session.id).unwrap().is_none());
+        assert!(store.path_messages(&session.id).unwrap().is_empty());
     }
 
     #[tokio::test]
