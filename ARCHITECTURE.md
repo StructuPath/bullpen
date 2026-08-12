@@ -323,7 +323,7 @@ that survives the UI.
 ## Resource bounds (v0)
 
 | Resource | Bound |
-|---|---|
+|---|--- |
 | Provider turns per send | 500 (fuse, not budget) |
 | Tool result in transcript | 256 KiB |
 | bash timeout | 120 s default, 600 s max |
