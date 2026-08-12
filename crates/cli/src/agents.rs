@@ -1,8 +1,8 @@
 //! `bullpen agents` — one screen for every background session.
 //!
 //! Daemonless by design: the dashboard is a read view over the SQLite store
-//! plus process-liveness checks. Dispatching a session spawns a detached
-//! `bullpen run` (see [`crate::bg`]); nothing here talks to those processes,
+//! plus process-liveness checks. Dispatching durably enqueues a prompt and
+//! kicks an internal detached worker (see [`crate::bg`]); nothing here talks to it,
 //! so quitting the dashboard never stops them. Attach-to-a-live-process
 //! (interactive takeover) is Stage 2 and needs a per-session control socket;
 //! for now a completed session is continued with `bullpen run -r <id>`.
@@ -80,17 +80,17 @@ impl App {
 }
 
 pub fn run() -> Result<()> {
-    let store = Store::open(&Store::default_path())?;
+    let mut store = Store::open(&Store::default_path())?;
 
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &store);
+    let result = event_loop(&mut terminal, &mut store);
     ratatui::restore();
     result
 }
 
 fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    store: &Store,
+    store: &mut Store,
 ) -> Result<()> {
     let mut app = App {
         rows: Vec::new(),
@@ -165,7 +165,7 @@ fn event_loop<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn dispatch(app: &mut App, store: &Store, prompt: &str) {
+fn dispatch(app: &mut App, store: &mut Store, prompt: &str) {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
@@ -177,7 +177,7 @@ fn dispatch(app: &mut App, store: &Store, prompt: &str) {
             return;
         }
     };
-    match crate::bg::spawn_detached(&session.id, prompt, &[]) {
+    match crate::bg::enqueue_and_spawn(store, &session.id, prompt, &serde_json::json!({})) {
         Ok(_) => app.refresh(store),
         Err(e) => app.error = Some(format!("dispatch failed: {e}")),
     }

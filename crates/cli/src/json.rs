@@ -83,10 +83,11 @@ pub fn result_json(session_id: &str, text: &str, usage: Usage, error: Option<&st
 /// The whole stream for a `--bg` dispatch: the run itself happens in another
 /// process, so there is nothing to stream but the handle to it.
 /// Pure so it can be tested without a terminal.
-pub fn dispatched_json(session_id: &str, pid: u32) -> Value {
+pub fn dispatched_json(session_id: &str, input_id: &str, pid: u32) -> Value {
     json!({
         "kind": KIND_DISPATCHED,
         "session_id": session_id,
+        "input_id": input_id,
         "pid": pid,
     })
 }
@@ -278,11 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatched_carries_the_full_id_and_pid() {
-        let id = "0123456789abcdef0123456789abcdef";
+    fn dispatched_carries_the_full_ids_and_pid() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let input_id = "fedcba9876543210fedcba9876543210";
         assert_eq!(
-            dispatched_json(id, 4242),
-            json!({ "kind": "dispatched", "session_id": id, "pid": 4242 })
+            dispatched_json(session_id, input_id, 4242),
+            json!({
+                "kind": "dispatched",
+                "session_id": session_id,
+                "input_id": input_id,
+                "pid": 4242,
+            })
         );
     }
 }

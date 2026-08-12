@@ -9,19 +9,20 @@ mod bg;
 mod json;
 mod worktree;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use bullpen_agent::{Agent, AgentConfig, AgentError, Event};
 use bullpen_auth::codex::{CodexAuth, CodexCliBorrow, StoredCodex};
 use bullpen_auth::{AuthFile, Credential, openrouter, pkce::Pkce};
-use bullpen_llm::Provider;
 use bullpen_llm::anthropic::{
     Anthropic, DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL, GLM_DEFAULT_MODEL, KIMI_DEFAULT_MODEL,
 };
 use bullpen_llm::chatcompletions::{ChatCompletions, OPENROUTER_DEFAULT_MODEL};
 use bullpen_llm::codex::{Codex, DEFAULT_CODEX_MODEL};
-use bullpen_store::{Session, SessionWorker, Store};
+use bullpen_llm::{ContentBlock, Message, Provider, Role};
+use bullpen_store::{Session, SessionInput, SessionWorker, Store};
 use bullpen_tools::{Registry, ToolCtx};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -96,6 +97,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Internal detached worker entry point.
+    #[command(hide = true)]
+    SessionWorker { session: String },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -213,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
             LoginProvider::Codex => login_codex().await,
         },
         Command::Sessions { json } => sessions(json),
+        Command::SessionWorker { session } => session_worker(&session).await,
     }
 }
 
@@ -373,7 +378,7 @@ async fn run(
         } else {
             None
         };
-        let store = Store::open(&Store::default_path())?;
+        let mut store = Store::open(&Store::default_path())?;
         let session = match &resume {
             Some(prefix) => store.resolve_session(prefix)?,
             None => {
@@ -381,12 +386,10 @@ async fn run(
                 store.create_session(&cwd.display().to_string(), provider_kind.name(), &model)?
             }
         };
-        let mut extra = Vec::new();
-        if sandbox_strict {
-            extra.push("--sandbox-strict".to_string());
-        } else if sandbox {
-            extra.push("--sandbox".to_string());
-        }
+        let options = serde_json::json!({
+            "sandbox": sandbox || sandbox_strict,
+            "sandbox_strict": sandbox_strict,
+        });
         let worktree_at = match &repo_root {
             Some(root) => {
                 let path = worktree::worktree_path(&session.id);
@@ -402,11 +405,20 @@ async fn run(
             }
             None => None,
         };
-        let pid = bg::spawn_detached(&session.id, &prompt, &extra)?;
+        let dispatch = bg::enqueue_and_spawn(&mut store, &session.id, &prompt, &options)?;
         if json {
-            json::emit(&json::dispatched_json(&session.id, pid));
+            json::emit(&json::dispatched_json(
+                &session.id,
+                &dispatch.input_id,
+                dispatch.pid,
+            ));
         } else {
-            println!("dispatched {} (pid {pid})", &session.id[..8]);
+            println!(
+                "dispatched {} input {} (pid {})",
+                &session.id[..8],
+                &dispatch.input_id[..8],
+                dispatch.pid
+            );
         }
         if let Some(path) = &worktree_at {
             eprintln!(
@@ -428,19 +440,16 @@ async fn run(
     // to type the command in.
     let mut store = Store::open(&Store::default_path())?;
 
-    let (session, provider_kind, model) = match &resume {
+    let session = match &resume {
         Some(prefix) => {
             let session = store.resolve_session(prefix)?;
-            let kind = ProviderKind::from_name(&session.provider)
+            ProviderKind::from_name(&session.provider)
                 .with_context(|| format!("session uses unknown provider `{}`", session.provider))?;
-            let model = session.model.clone();
-            (session, kind, model)
+            session
         }
         None => {
             let model = model.unwrap_or_else(|| provider_kind.default_model());
-            let session =
-                store.create_session(&cwd.display().to_string(), provider_kind.name(), &model)?;
-            (session, provider_kind, model)
+            store.create_session(&cwd.display().to_string(), provider_kind.name(), &model)?
         }
     };
 
@@ -453,19 +462,94 @@ async fn run(
     // or recovery error is then recorded as a failed run by the guard.
     session_worker.start(&mut store)?;
 
-    // A recorded worktree wins over the caller's cwd. This is the only
-    // mechanism that places a run: the detached background child is a
-    // `run --resume` and arrives here too, as does a resume typed by hand
-    // from anywhere.
+    match execute_input(
+        &session,
+        &prompt,
+        cwd,
+        sandbox,
+        sandbox_strict,
+        verbose,
+        json,
+        JournalSource::Direct,
+    )
+    .await
+    {
+        Ok(executed) => complete_foreground_execution(
+            executed,
+            |status| {
+                session_worker
+                    .finish(status)
+                    .context("record terminal session worker status")
+            },
+            |terminal| json::emit(&terminal),
+        ),
+        Err(error) => {
+            session_worker
+                .finish("failed")
+                .context("record terminal session worker status")?;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Clone)]
+enum JournalSource {
+    Direct,
+    Queued(String),
+}
+
+struct ExecutedInput {
+    terminal_json: Option<serde_json::Value>,
+    result: anyhow::Result<()>,
+}
+
+impl ExecutedInput {
+    fn status(&self) -> &'static str {
+        if self.result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        }
+    }
+}
+
+fn complete_foreground_execution(
+    executed: ExecutedInput,
+    mut finish: impl FnMut(&str) -> anyhow::Result<()>,
+    mut emit: impl FnMut(serde_json::Value),
+) -> anyhow::Result<()> {
+    finish(executed.status())?;
+    if let Some(terminal) = executed.terminal_json {
+        emit(terminal);
+    }
+    executed.result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_input(
+    session: &Session,
+    prompt: &str,
+    fallback_cwd: PathBuf,
+    sandbox: bool,
+    sandbox_strict: bool,
+    verbose: bool,
+    json: bool,
+    journal_source: JournalSource,
+) -> anyhow::Result<ExecutedInput> {
+    let provider_kind = ProviderKind::from_name(&session.provider)
+        .with_context(|| format!("session uses unknown provider `{}`", session.provider))?;
+
+    // A recorded worktree wins over the caller's cwd. Foreground shared runs
+    // keep the caller's cwd; internal workers receive the session's saved cwd.
     let cwd = match worktree::locate(
         session.worktree_path.as_deref(),
         session.worktree_branch.as_deref(),
-        std::path::Path::new(&session.cwd),
+        Path::new(&session.cwd),
     ) {
-        worktree::Location::Shared => cwd,
+        worktree::Location::Shared => fallback_cwd,
         worktree::Location::Use(path) => path,
         worktree::Location::Recreate { path, branch } => {
-            let root = worktree::repo_root(std::path::Path::new(&session.cwd))?;
+            let root = worktree::repo_root(Path::new(&session.cwd))?;
             worktree::recreate(&root, &path, &branch)?;
             eprintln!("[recreated worktree {} from {branch}]", path.display());
             path
@@ -487,7 +571,6 @@ async fn run(
         ),
     };
 
-    // Build the write-confinement sandbox, if requested.
     let sandbox = (sandbox || sandbox_strict).then(|| {
         let base = if sandbox_strict {
             bullpen_sandbox::Sandbox::strict(&cwd)
@@ -503,35 +586,28 @@ async fn run(
         );
     }
 
-    // Recover any run a previous process left open, then rebuild the
-    // transcript from the durable entry tree.
+    let mut store = Store::open(&Store::default_path())?;
     let (transcript, recovery) = bullpen_harness::prepare_session(&mut store, &session.id)?;
-    if let Some(r) = &recovery {
+    if let Some(recovery) = &recovery {
         eprintln!(
             "[recovered interrupted run {}: {} tool call(s) marked interrupted]",
-            &r.run_id[..8],
-            r.interrupted_tools
+            &recovery.run_id[..8],
+            recovery.interrupted_tools
         );
     }
     let usage = store.get_session(&session.id)?.usage;
-    // Only the lock-owning worker writes lifecycle state. The detached parent
-    // deliberately does not: a fast child may already have completed by the
-    // time spawn returns.
     drop(store);
 
     let provider = build_provider(provider_kind)?;
     let config = AgentConfig {
-        model,
+        model: session.model.clone(),
         system: system_prompt(&cwd),
         ..Default::default()
     };
 
-    // Tool activity (verbose only) goes to stderr.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            // One task owns stdout under --json, so event order is the order
-            // the loop produced them in.
             if json {
                 json::emit(&json::event_json(&event));
             }
@@ -543,20 +619,16 @@ async fn run(
                 Event::ToolEnd { name, is_error, .. } if is_error => {
                     eprintln!("✗ {name} failed")
                 }
-                // Assistant text streams to stdout via the delta sink below.
                 Event::AssistantText { .. } | Event::ToolEnd { .. } | Event::TurnDone { .. } => {}
             }
         }
     });
 
-    // Assistant text streams to stdout as it is generated.
     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let streamer = tokio::spawn(async move {
         use std::io::Write;
         let mut out = std::io::stdout();
         while let Some(text) = delta_rx.recv().await {
-            // The sink stays attached under --json so the agent still takes
-            // its streaming path; only the raw text is dropped.
             if json {
                 continue;
             }
@@ -566,16 +638,21 @@ async fn run(
     });
 
     let mut tool_ctx = ToolCtx::new(cwd.clone());
-    if let Some(sb) = &sandbox {
-        tool_ctx = tool_ctx.with_sandbox(sb.clone());
+    if let Some(sandbox) = &sandbox {
+        tool_ctx = tool_ctx.with_sandbox(sandbox.clone());
     }
-    // The journal persists every step of the run as it happens (its own
-    // store handle; WAL makes the two connections safe). If the process
-    // dies mid-run, the next invocation recovers from the durable state.
-    let journal =
-        bullpen_harness::StoreJournal::new(Store::open(&Store::default_path())?, &session.id);
-    // The pen: the model can delegate bounded tasks to durable child agents
-    // (sessions in the same store, resumable and listed like any other).
+    let journal: Box<dyn bullpen_agent::Journal> = match journal_source {
+        JournalSource::Direct => Box::new(bullpen_harness::StoreJournal::new(
+            Store::open(&Store::default_path())?,
+            &session.id,
+        )),
+        JournalSource::Queued(input_id) => Box::new(bullpen_harness::StoreJournal::for_input(
+            Store::open(&Store::default_path())?,
+            &session.id,
+            input_id,
+        )),
+    };
+
     let mut pen_config = bullpen_harness::PenConfig::new(
         Store::default_path(),
         cwd.clone(),
@@ -583,11 +660,11 @@ async fn run(
         config.model.clone(),
         system_prompt(&cwd),
     );
-    if let Some(sb) = &sandbox {
-        pen_config = pen_config.with_sandbox(sb.clone());
+    if let Some(sandbox) = &sandbox {
+        pen_config = pen_config.with_sandbox(sandbox.clone());
     }
     let mut registry = Registry::standard();
-    registry.register(std::sync::Arc::new(bullpen_harness::PenTool::new(
+    registry.register(Arc::new(bullpen_harness::PenTool::new(
         provider.clone(),
         &session.id,
         pen_config,
@@ -596,46 +673,27 @@ async fn run(
         .with_transcript(transcript, usage)
         .with_events(tx)
         .with_delta_sink(delta_tx)
-        .with_journal(Box::new(journal));
+        .with_journal(journal);
 
-    let result = agent.send(&prompt).await;
+    let result = agent.send(prompt).await;
     let usage = agent.usage();
-    // The agent owns the event + delta senders; it must drop before the
-    // receive loops can end, or these awaits never return.
     drop(agent);
     let _ = printer.await;
     let _ = streamer.await;
 
-    // Record the terminal state only for our persisted worker generation.
-    let final_status = if result.is_ok() {
-        "completed"
-    } else {
-        "failed"
-    };
-    session_worker
-        .finish(final_status)
-        .context("record terminal session worker status")?;
-
-    // Both consumer tasks have joined, so this is provably the last line of
-    // the stream. It carries the outcome outright: a consumer must never have
-    // to infer completion from stdout closing.
-    if json {
+    let terminal_json = json.then(|| {
         let (text, error) = match &result {
             Ok(text) => (text.as_str(), None),
-            Err(e @ AgentError::Truncated { partial }) => (partial.as_str(), Some(e.to_string())),
-            Err(e) => ("", Some(e.to_string())),
+            Err(error @ AgentError::Truncated { partial }) => {
+                (partial.as_str(), Some(error.to_string()))
+            }
+            Err(error) => ("", Some(error.to_string())),
         };
-        json::emit(&json::result_json(
-            &session.id,
-            text,
-            usage,
-            error.as_deref(),
-        ));
-    }
+        json::result_json(&session.id, text, usage, error.as_deref())
+    });
 
-    match result {
+    let result = match result {
         Ok(_) => {
-            // The answer already streamed to stdout; just close the line.
             if !json {
                 println!();
             }
@@ -648,13 +706,99 @@ async fn run(
             );
             Ok(())
         }
-        Err(e) => {
+        Err(error) => {
             if !json {
                 println!();
             }
-            bail!("agent error (session {} saved): {e}", &session.id[..8])
+            Err(anyhow::anyhow!(
+                "agent error (session {} saved): {error}",
+                &session.id[..8]
+            ))
+        }
+    };
+    Ok(ExecutedInput {
+        terminal_json,
+        result,
+    })
+}
+
+fn queued_input_text(input: &SessionInput) -> anyhow::Result<String> {
+    let message: Message = serde_json::from_value(input.prompt.clone())?;
+    match (message.role, message.content.as_slice()) {
+        (Role::User, [ContentBlock::Text { text }]) => Ok(text.clone()),
+        _ => bail!(
+            "queued input {} is not exactly one user text message",
+            input.id
+        ),
+    }
+}
+
+fn sandbox_options(options: &serde_json::Value) -> anyhow::Result<(bool, bool)> {
+    let object = options
+        .as_object()
+        .context("queued input options must be an object")?;
+    for (name, value) in object {
+        if !matches!(name.as_str(), "sandbox" | "sandbox_strict") {
+            bail!("unknown queued input option `{name}`");
+        }
+        if !value.is_boolean() {
+            bail!("queued {name} option must be boolean");
         }
     }
+    let sandbox = object
+        .get("sandbox")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let strict = object
+        .get("sandbox_strict")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok((sandbox || strict, strict))
+}
+
+async fn session_worker(session_id: &str) -> anyhow::Result<()> {
+    let db_path = Store::default_path();
+    let session = Store::open(&db_path)?.resolve_session(session_id)?;
+    let mut worker = SessionWorker::ensure(&db_path, &session.id)?;
+
+    let mut store = Store::open(&db_path)?;
+    if !store.has_pending_or_open_work(&session.id)? {
+        return Ok(());
+    }
+    worker.start_draining(&mut store)?;
+    let (_, recovery) = bullpen_harness::prepare_session(&mut store, &session.id)?;
+    if let Some(recovery) = recovery {
+        eprintln!(
+            "[recovered interrupted run {}: {} tool call(s) marked interrupted]",
+            &recovery.run_id[..8],
+            recovery.interrupted_tools
+        );
+    }
+    drop(store);
+
+    let fallback_cwd = PathBuf::from(&session.cwd);
+    bullpen_harness::drain_session_inputs(&db_path, &mut worker, |input| {
+        let session = session.clone();
+        let fallback_cwd = fallback_cwd.clone();
+        async move {
+            let prompt = queued_input_text(&input)?;
+            let (sandbox, sandbox_strict) = sandbox_options(&input.options)?;
+            execute_input(
+                &session,
+                &prompt,
+                fallback_cwd,
+                sandbox,
+                sandbox_strict,
+                false,
+                false,
+                JournalSource::Queued(input.id),
+            )
+            .await?
+            .result
+        }
+    })
+    .await
+    .map_err(anyhow::Error::new)
 }
 
 fn logs(prefix: &str) -> anyhow::Result<()> {
@@ -778,6 +922,70 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
         }
+    }
+
+    #[test]
+    fn sandbox_options_fail_closed_and_strict_implies_sandbox() {
+        for invalid in [
+            json!(null),
+            json!([]),
+            json!("sandboxed"),
+            json!({"sandbox": null}),
+            json!({"sandbox": "true"}),
+            json!({"sandbox_strict": 1}),
+            json!({"other": true}),
+        ] {
+            assert!(sandbox_options(&invalid).is_err(), "accepted {invalid}");
+        }
+        assert_eq!(sandbox_options(&json!({})).unwrap(), (false, false));
+        assert_eq!(
+            sandbox_options(&json!({"sandbox_strict": true})).unwrap(),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn foreground_terminal_json_is_emitted_after_finish() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let executed = ExecutedInput {
+            terminal_json: Some(json!({"kind": "result"})),
+            result: Ok(()),
+        };
+        complete_foreground_execution(
+            executed,
+            |status| {
+                events.borrow_mut().push(format!("finish:{status}"));
+                Ok(())
+            },
+            |terminal| {
+                events
+                    .borrow_mut()
+                    .push(format!("emit:{}", terminal["kind"]))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events.into_inner(),
+            vec!["finish:completed", "emit:\"result\""]
+        );
+    }
+
+    #[test]
+    fn foreground_terminal_json_is_not_emitted_when_finish_fails() {
+        let emitted = std::cell::Cell::new(false);
+        let executed = ExecutedInput {
+            terminal_json: Some(json!({"kind": "result"})),
+            result: Ok(()),
+        };
+        assert!(
+            complete_foreground_execution(
+                executed,
+                |_| Err(anyhow::anyhow!("finish failed")),
+                |_| emitted.set(true),
+            )
+            .is_err()
+        );
+        assert!(!emitted.get());
     }
 
     #[test]

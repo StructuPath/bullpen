@@ -28,10 +28,10 @@ bullpen mid-run — crash, `kill -9`, power loss — and the next invocation
 recovers: interrupted tool calls are marked, the transcript is closed
 cleanly, and the session resumes where it stopped.
 
-**No daemon, no supervisor.** A background session is just a detached
-`bullpen run` coordinating through the store. The dashboard is a read-and-
-dispatch view over that store — close it and the work keeps going, because
-nothing was ever supervising it.
+**No daemon, no supervisor.** A background prompt is durably queued before a
+detached internal worker is kicked. The dashboard is a read-and-dispatch view
+over that store—close it and the work keeps going, because nothing was ever
+supervising it.
 
 **The sandbox is a feature, not a footnote.** `--sandbox` confines writes to
 the workspace on every platform and, on macOS, runs shell commands *and their
@@ -93,6 +93,25 @@ bullpen logs 6ee4acc9                      # tail a background session
 lets you dispatch from the input line, `Space` to peek at output, `Esc` to
 quit. Quitting stops nothing.
 
+Both `run --bg` and dashboard dispatch first enqueue the exact user message and
+its sandbox options in the schema-v10 durable FIFO, then always kick a
+prompt-free worker using only the session id. One worker lock serially drains
+that inbox; redundant kicks wait on the crash-released lock and become orderly
+successors, so an input queued just before the current worker fails is not
+stranded. Each input sees the complete transcript and cumulative usage left by
+the one before it. A failed input marks that worker failed and leaves later
+inputs for a waiting or later kick. Worker logs are append-only, so redundant
+kicks cannot erase output.
+A successful spawn means only that the kick process launched, not that the
+worker became ready. If spawn or post-spawn startup fails, the command or log
+reports the failure and the already-durable input remains pending until another
+explicit background or dashboard dispatch supplies a kick.
+
+There is one daemonless edge to be explicit about: if the dispatching process
+crashes after the enqueue commits but before it attempts the spawn, no daemon
+exists to discover the row. The next background or dashboard dispatch supplies
+a new worker kick.
+
 Plain `--bg` sessions share your checkout, so two of them edit the same
 files. `--worktree` gives a session a git worktree of its own on a
 run-unique `bullpen/<id>` branch, under `$BULLPEN_HOME/worktrees/<session>`;
@@ -114,7 +133,7 @@ delegation reattaches to its child instead of running it twice.
 ## Providers
 
 | Provider | Wire format | Auth | Verified |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `anthropic` | Anthropic messages | `ANTHROPIC_API_KEY` | wire-level tests |
 | `codex` | OpenAI Responses (SSE) | `bullpen login codex`, or borrow the Codex CLI | live, incl. tools + resume |
 | `openrouter` | OpenAI chat-completions | `bullpen login openrouter` or `OPENROUTER_API_KEY` | live, incl. tools |
@@ -150,7 +169,7 @@ directly in it, with no `.bullpen` segment appended.
 **v0.** Honest about what that means:
 
 | | |
-|---|---|
+| --- | --- |
 | ✅ Shipped | Durable execution + crash recovery · the pen (durable subagents) · write-confinement sandbox with Seatbelt on macOS · agent view (dispatch, peek, live state) · 5 providers |
 | 🚧 Next | Interactive attach to a live session · needs-input state · notifications · compaction |
 | 📋 Planned | Landlock confinement on Linux · a durable workflow engine (steps in SQLite, resumable from any step) |

@@ -3,6 +3,7 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bullpen_store::{SessionInputState, Store};
 use serde_json::Value;
 
 fn bullpen(home: &std::path::Path, args: &[&str]) -> Output {
@@ -29,15 +30,21 @@ fn sessions(home: &std::path::Path) -> Vec<Value> {
 }
 
 #[test]
-fn pre_spawn_failure_never_marks_the_session_running() {
+fn pre_spawn_failure_leaves_the_durable_input_pending() {
     let dir = tempfile::tempdir().unwrap();
-    // `spawn_detached` must create this directory before it can launch. A file
+    // `spawn_detached_worker` must create this directory before launch. A file
     // at the same path forces a deterministic pre-spawn failure.
     fs::write(dir.path().join("logs"), b"not a directory").unwrap();
 
     let output = bullpen(
         dir.path(),
-        &["run", "--bg", "--json", "this dispatch must fail"],
+        &[
+            "run",
+            "--bg",
+            "--json",
+            "--sandbox-strict",
+            "this dispatch must fail",
+        ],
     );
     assert!(!output.status.success());
 
@@ -45,6 +52,20 @@ fn pre_spawn_failure_never_marks_the_session_running() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["status"], "idle");
     assert!(rows[0]["pid"].is_null());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("durably queued"), "{stderr}");
+    assert!(stderr.contains("remains pending"), "{stderr}");
+
+    let store = Store::open(&dir.path().join("bullpen.db")).unwrap();
+    let inputs = store.list_inputs(rows[0]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].state, SessionInputState::Pending);
+    assert_eq!(
+        inputs[0].prompt["content"][0]["text"],
+        "this dispatch must fail"
+    );
+    assert_eq!(inputs[0].options["sandbox"], true);
+    assert_eq!(inputs[0].options["sandbox_strict"], true);
 }
 
 #[test]

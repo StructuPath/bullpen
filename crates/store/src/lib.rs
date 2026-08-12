@@ -1,6 +1,6 @@
 //! Durable local state.
 //!
-//! One SQLite database in WAL mode. Schema v8 implements the durable
+//! One SQLite database in WAL mode. Schema v10 implements the durable
 //! execution model from ARCHITECTURE.md ("Persistence and durable
 //! execution"):
 //!
@@ -19,10 +19,10 @@ mod recovery;
 pub mod status;
 mod worker;
 
-pub use inbox::{SessionInput, SessionInputState};
+pub use inbox::{DrainDecision, EnqueueInputResult, SessionInput, SessionInputState};
 pub use recovery::{Recovery, recover};
 pub use status::AgentStatus;
-pub use worker::{SessionWorker, WorkerError};
+pub use worker::{SessionWorker, WorkerError, WorkerKind};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,8 @@ pub enum StoreError {
     Ambiguous(String),
     #[error("corrupt session state: {0}")]
     Corrupt(String),
+    #[error("session worker generation is no longer current")]
+    StaleWorkerGeneration,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +151,12 @@ impl Store {
         let observed: i64 = self
             .conn
             .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
-        if observed >= 8 {
+        if observed > 10 {
+            return Err(StoreError::Corrupt(format!(
+                "database schema version {observed} is newer than this bullpen supports (10)"
+            )));
+        }
+        if observed == 10 {
             return Ok(());
         }
 
@@ -160,6 +167,11 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = tx.query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
+        if version > 10 {
+            return Err(StoreError::Corrupt(format!(
+                "database schema version {version} is newer than this bullpen supports (10)"
+            )));
+        }
         if version < 1 {
             tx.execute_batch(
                 "CREATE TABLE sessions (
@@ -275,6 +287,43 @@ impl Store {
                  PRAGMA user_version = 8;",
             )?;
         }
+        if version < 9 {
+            tx.execute_batch(
+                "ALTER TABLE session_inputs
+                    ADD COLUMN options TEXT NOT NULL DEFAULT '{}';
+                 PRAGMA user_version = 9;",
+            )?;
+        }
+        if version < 10 {
+            let duplicate_operation_id: Option<String> = tx
+                .query_row(
+                    "SELECT operation_id FROM session_inputs
+                     WHERE operation_id IS NOT NULL
+                     GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(operation_id) = duplicate_operation_id {
+                return Err(StoreError::Corrupt(format!(
+                    "duplicate session input operation id `{operation_id}` prevents schema v10 migration"
+                )));
+            }
+            validate_started_input_links(&tx)?;
+            tx.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN worker_kind TEXT
+                    CHECK (worker_kind IN ('non_draining', 'draining'));
+                 CREATE UNIQUE INDEX session_inputs_operation
+                    ON session_inputs(operation_id) WHERE operation_id IS NOT NULL;
+                 CREATE INDEX records_operation_started
+                    ON records(session_id, id, seq)
+                    WHERE kind = 'operation_started';
+                 CREATE INDEX records_operation_finished
+                    ON records(session_id, run_id)
+                    WHERE kind = 'operation_finished';
+                 PRAGMA user_version = 10;",
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -360,7 +409,12 @@ impl Store {
     /// The generation makes terminal updates conditional: a stale worker can
     /// never overwrite a newer worker's state, even if lifecycle code is
     /// accidentally reordered around process startup in the future.
-    pub fn start_worker(&mut self, session_id: &str, pid: i64) -> Result<String, StoreError> {
+    pub fn start_worker(
+        &mut self,
+        session_id: &str,
+        pid: i64,
+        kind: WorkerKind,
+    ) -> Result<String, StoreError> {
         let generation = uuid::Uuid::new_v4().to_string();
         let tx = self
             .conn
@@ -368,15 +422,44 @@ impl Store {
         let changed = tx.execute(
             "UPDATE sessions
              SET status = 'running', pid = ?2, worker_generation = ?3,
-                 updated_at = datetime('now')
+                 worker_kind = ?4, updated_at = datetime('now')
              WHERE id = ?1",
-            params![session_id, pid, generation],
+            params![session_id, pid, generation, kind.as_str()],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(session_id.to_string()));
         }
         tx.commit()?;
         Ok(generation)
+    }
+
+    /// The generation currently registered for a session, if any.
+    pub fn worker_generation(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.worker_registration(session_id)?.0)
+    }
+
+    /// Current durable ownership generation and its drain capability.
+    pub fn worker_registration(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<String>, Option<WorkerKind>), StoreError> {
+        self.conn
+            .query_row(
+                "SELECT worker_generation, worker_kind FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    let generation = row.get(0)?;
+                    let raw_kind: Option<String> = row.get(1)?;
+                    let kind = raw_kind.as_deref().and_then(WorkerKind::from_str);
+                    Ok((generation, kind))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(session_id.to_string())
+                }
+                other => StoreError::Db(other),
+            })
     }
 
     /// Finish a worker only if it still owns the session generation.
@@ -393,7 +476,7 @@ impl Store {
         let changed = tx.execute(
             "UPDATE sessions
              SET status = ?3, pid = NULL, worker_generation = NULL,
-                 updated_at = datetime('now')
+                 worker_kind = NULL, updated_at = datetime('now')
              WHERE id = ?1 AND worker_generation = ?2",
             params![session_id, generation, status],
         )?;
@@ -758,6 +841,55 @@ fn next_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64, Sto
     Ok(seq)
 }
 
+type StartedInputLinkRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// v9 → v10: every already-started input must point to its own same-session
+/// operation-start record. Fail closed rather than preserving stranded work.
+fn validate_started_input_links(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let rows: Vec<StartedInputLinkRow> = tx
+        .prepare(
+            "SELECT input.id, input.session_id, input.operation_id,
+                    record.session_id, record.kind, record.payload
+             FROM session_inputs input
+             LEFT JOIN records record ON record.id = input.operation_id
+             WHERE input.state = 'started'",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    for (input_id, input_session, operation_id, operation_session, kind, payload) in rows {
+        let valid_record = operation_id.is_some()
+            && operation_session.as_deref() == Some(input_session.as_str())
+            && kind.as_deref() == Some("operation_started");
+        let linked_input = payload
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+            .and_then(|payload| payload.get("input_id")?.as_str().map(str::to_string));
+        if !valid_record || linked_input.as_deref() != Some(input_id.as_str()) {
+            return Err(StoreError::Corrupt(format!(
+                "started session input `{input_id}` has no matching same-session operation-start record"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// v2 → v3: turn each session's flat message list into an entry chain and
 /// point the lane leaf at the last one.
 fn migrate_messages_to_entries(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
@@ -1039,6 +1171,11 @@ mod tests {
                     status TEXT NOT NULL DEFAULT 'idle',
                     pid INTEGER
                  );
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL
+                 );
                  INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
                  PRAGMA user_version = 5;",
             )
@@ -1074,6 +1211,11 @@ mod tests {
                     worktree_path TEXT,
                     worktree_branch TEXT
                  );
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL
+                 );
                  INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
                  PRAGMA user_version = 6;",
             )
@@ -1081,7 +1223,9 @@ mod tests {
         }
 
         let mut store = Store::open(&path).unwrap();
-        let generation = store.start_worker("s1", 42).unwrap();
+        let generation = store
+            .start_worker("s1", 42, WorkerKind::NonDraining)
+            .unwrap();
         assert!(store.finish_worker("s1", &generation, "completed").unwrap());
         let session = store.get_session("s1").unwrap();
         assert_eq!(session.status, "completed");
@@ -1089,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_first_open_serializes_the_v8_migration() {
+    fn concurrent_first_open_serializes_the_v10_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("concurrent-v7.db");
         {
@@ -1144,7 +1288,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1211,15 +1355,244 @@ mod tests {
             .conn
             .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
+    }
+
+    #[test]
+    fn migrates_v8_inputs_preserving_pending_and_started_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v8.db");
+        let pending_prompt = msg_payload(&Message::user_text("pending prompt")).to_string();
+        let started_prompt = msg_payload(&Message::user_text("started prompt")).to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle', pid INTEGER,
+                    worktree_path TEXT, worktree_branch TEXT,
+                    worker_generation TEXT
+                 );
+                 CREATE TABLE entries (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    parent_id TEXT, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+                    payload TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE TABLE lanes (
+                    session_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT 'main',
+                    leaf_id TEXT, open_operation_id TEXT,
+                    PRIMARY KEY (session_id, name)
+                 );
+                 CREATE TABLE session_inputs (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    position INTEGER NOT NULL, prompt TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'started')),
+                    operation_id TEXT, enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    started_at TEXT, UNIQUE (session_id, position),
+                    CHECK (
+                        (state = 'pending' AND operation_id IS NULL AND started_at IS NULL)
+                        OR
+                        (state = 'started' AND operation_id IS NOT NULL AND started_at IS NOT NULL)
+                    )
+                 );
+                 CREATE INDEX session_inputs_pending
+                    ON session_inputs(session_id, state, position);
+                 INSERT INTO sessions (id, cwd, model, next_seq)
+                    VALUES ('s1', '/tmp', 'm', 3);
+                 INSERT INTO entries (id, session_id, seq, kind, payload)
+                    VALUES ('entry-started', 's1', 2, 'message', '{}');
+                 INSERT INTO records (id, session_id, run_id, seq, kind, payload)
+                    VALUES ('operation-1', 's1', 'operation-1', 1,
+                            'operation_started', '{\"input_id\":\"started\"}');
+                 INSERT INTO lanes (session_id, name, leaf_id, open_operation_id)
+                    VALUES ('s1', 'main', 'entry-started', 'operation-1');
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_inputs
+                    (id, session_id, position, prompt)
+                 VALUES ('pending', 's1', 1, ?1)",
+                params![pending_prompt],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_inputs
+                    (id, session_id, position, prompt, state, operation_id, started_at)
+                 VALUES ('started', 's1', 2, ?1, 'started', 'operation-1',
+                         '2026-08-12 07:00:00')",
+                params![started_prompt],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let inputs = store.list_inputs("s1").unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].state, SessionInputState::Pending);
+        assert_eq!(
+            inputs[0].prompt,
+            msg_payload(&Message::user_text("pending prompt"))
+        );
+        assert_eq!(inputs[0].options, json!({}));
+        assert_eq!(inputs[1].state, SessionInputState::Started);
+        assert_eq!(
+            inputs[1].prompt,
+            msg_payload(&Message::user_text("started prompt"))
+        );
+        assert_eq!(inputs[1].operation_id.as_deref(), Some("operation-1"));
+        assert_eq!(inputs[1].started_at.as_deref(), Some("2026-08-12 07:00:00"));
+        assert_eq!(inputs[1].options, json!({}));
+        assert_eq!(store.leaf("s1").unwrap().as_deref(), Some("entry-started"));
+        assert_eq!(store.open_run("s1").unwrap().unwrap().run_id, "operation-1");
+        let version: i64 = store
+            .conn
+            .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+    }
+
+    #[test]
+    fn v10_migration_rejects_duplicate_input_operation_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate-v9.db");
+        let prompt = msg_payload(&Message::user_text("duplicate")).to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT, status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER, worktree_path TEXT, worktree_branch TEXT,
+                    worker_generation TEXT
+                 );
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL
+                 );
+                 CREATE TABLE session_inputs (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    position INTEGER NOT NULL, prompt TEXT NOT NULL,
+                    state TEXT NOT NULL, operation_id TEXT, enqueued_at TEXT NOT NULL,
+                    started_at TEXT, options TEXT NOT NULL DEFAULT '{}'
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_inputs
+                    (id, session_id, position, prompt, state, operation_id, enqueued_at, started_at)
+                 VALUES ('one', 's1', 1, ?1, 'started', 'same-operation', datetime('now'), datetime('now')),
+                        ('two', 's1', 2, ?1, 'started', 'same-operation', datetime('now'), datetime('now'))",
+                params![prompt],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            matches!(Store::open(&path), Err(StoreError::Corrupt(message)) if message.contains("duplicate session input operation id"))
+        );
+    }
+
+    #[test]
+    fn v10_migration_rejects_started_input_without_matching_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling-v9.db");
+        let prompt = msg_payload(&Message::user_text("dangling")).to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT, status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER, worktree_path TEXT, worktree_branch TEXT,
+                    worker_generation TEXT
+                 );
+                 CREATE TABLE records (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'main', run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL
+                 );
+                 CREATE TABLE session_inputs (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    position INTEGER NOT NULL, prompt TEXT NOT NULL,
+                    state TEXT NOT NULL, operation_id TEXT, enqueued_at TEXT NOT NULL,
+                    started_at TEXT, options TEXT NOT NULL DEFAULT '{}'
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_inputs
+                    (id, session_id, position, prompt, state, operation_id, enqueued_at, started_at)
+                 VALUES ('input-1', 's1', 1, ?1, 'started', 'missing-operation',
+                         datetime('now'), datetime('now'))",
+                params![prompt],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            matches!(Store::open(&path), Err(StoreError::Corrupt(message)) if message.contains("no matching same-session operation-start"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_database_from_a_newer_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 11;")
+            .unwrap();
+
+        assert!(
+            matches!(Store::open(&path), Err(StoreError::Corrupt(message)) if message.contains("newer than this bullpen supports"))
+        );
     }
 
     #[test]
     fn stale_worker_cannot_overwrite_the_current_generation() {
         let (_dir, mut store) = store();
         let session = store.create_session("/repo", "anthropic", "m").unwrap();
-        let stale = store.start_worker(&session.id, 11).unwrap();
-        let current = store.start_worker(&session.id, 22).unwrap();
+        let stale = store
+            .start_worker(&session.id, 11, WorkerKind::NonDraining)
+            .unwrap();
+        let current = store
+            .start_worker(&session.id, 22, WorkerKind::NonDraining)
+            .unwrap();
 
         assert!(
             !store
@@ -1238,6 +1611,10 @@ mod tests {
         let failed = store.get_session(&session.id).unwrap();
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.pid, None);
+        assert_eq!(
+            store.worker_registration(&session.id).unwrap(),
+            (None, None)
+        );
     }
 
     #[test]

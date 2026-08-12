@@ -154,6 +154,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -201,6 +202,7 @@ dependencies = [
  "bullpen-tools",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "uuid",
 ]

@@ -14,7 +14,7 @@ is a place where the common harness design gives up something bullpen
 refuses to:
 
 | | Commitment | What it rules out |
-|---|---|---|
+| --- | --- | --- |
 | 1 | **One durable store.** A single SQLite database (WAL) holds every session, agent run, and workflow step — cross-process safe, resumable by design | State that dies with the process, and JSON files that lose concurrent writes |
 | 2 | **Real confinement.** OS-level sandboxing (Seatbelt on macOS, Landlock intended on Linux) with a capability model resolved per tool call | Approval prompts as the only boundary — friction, not authorization |
 | 3 | **Durable orchestration.** Workflow steps persisted and resumable from any point, not held in a UI | A checklist that exists only while something is watching it |
@@ -28,7 +28,7 @@ Dependency direction is enforced by the workspace — a crate may only depend on
 crates above it in this table:
 
 | Crate | Owns | Must never know about |
-|---|---|---|
+| --- | --- | --- |
 | `bullpen-llm` | Provider-neutral conversation types, `Provider` trait, wire-format adapters (Anthropic messages, OpenAI chat-completions, Codex Responses/SSE), shared retry policy | Tools, transcripts, UI |
 | `bullpen-auth` | Credential store (`~/.bullpen/auth.json` or `$BULLPEN_HOME/auth.json`, 0600, atomic), PKCE, OpenRouter OAuth, Codex device-code flow + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
 | `bullpen-tools` | `Tool` trait, `Registry`, built-ins (bash, read/write/edit, grep, glob), parallel-safety flags | Providers, the loop |
@@ -51,7 +51,7 @@ every supported provider, and compatible hosts (GLM, Kimi) become config, not
 code:
 
 | Provider | Wire format | Auth | Verified |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `anthropic` | Anthropic messages | `ANTHROPIC_API_KEY` | wire-level tests only |
 | `openrouter` | OpenAI chat-completions | `bullpen login openrouter` (official OAuth PKCE → API key) or `OPENROUTER_API_KEY` | live, incl. tool round-trip (2026-08-07) |
 | `codex` | OpenAI Responses over SSE | `bullpen login codex` (device-code flow) or read-only borrow of the Codex CLI's `~/.codex/auth.json` | live, incl. tool round-trip and session resume (2026-08-07) |
@@ -105,14 +105,16 @@ never stops the loop.
 ## Persistence and durable execution
 
 One database: `~/.bullpen/bullpen.db`, WAL mode, `busy_timeout` set, schema
-versioned by `pragma user_version` (v8). Session ids resolve by unique
+versioned by `pragma user_version` (v10). Session ids resolve by unique
 prefix. `BULLPEN_HOME` overrides the directory (see README, "Where state
 lives"). v6 added `sessions.worktree_path` / `worktree_branch`, both NULL
 for a session that shares the caller's checkout; v7 added the transient
 `worker_generation` ownership token; v8 added the durable ordered
-`session_inputs` inbox. A session's `cwd` stays the directory
-it was dispatched from, which is what still points at the repository when
-the worktree itself is gone.
+`session_inputs` inbox; v9 added each input's persisted execution `options`
+(currently sandbox and strict-sandbox policy); v10 added durable worker kind
+and input/operation integrity indexes. A session's `cwd` stays the
+directory it was dispatched from, which is what still points at the repository
+when the worktree itself is gone.
 
 The durability rule, the reduction idea, and the recovery discipline below
 are adapted from pi's `harness-v2.md` design spec — see
@@ -134,14 +136,49 @@ record leaves a complete, valid conversation.
 
 **Session inputs** are caller-idempotent prompts waiting in a durable FIFO.
 Their per-session positions are allocated under an IMMEDIATE transaction.
-Starting the oldest pending input is one atomic transaction: mark it started,
-open its linked operation, append its single user entry, and advance the lane
-pointers. Before commit it remains pending; after commit ordinary operation
-recovery owns the run and the prompt is never requeued or appended again.
-Direct runs continue to use the ordinary journal path without an inbox row.
+Background `run --bg` and dashboard dispatch serialize
+`Message::user_text(prompt)` plus execution options into a UUID input row
+*before* kicking a worker. Starting the oldest pending input is one atomic
+transaction: mark it started, open its linked operation, append its single user
+entry, and advance the lane pointers. Before commit it remains pending; after
+commit ordinary operation recovery owns the run and the prompt is never
+requeued or appended again. Direct foreground runs continue to use
+`StoreJournal::new` without an inbox row.
 
 Entries and records share one per-session monotonic `seq`, allocated inside
 the storage write — callers never see or pass sequence numbers or parent ids.
+
+### Daemonless worker kicks and serial drain
+
+A detached kick invokes the hidden `session-worker <session-id>` command. Its
+argv contains only command and session identity—never prompt text or sandbox
+policy—and its log is opened append-only, so a redundant or later kick cannot
+truncate earlier output. `SessionWorker::ensure` acquires the crash-released
+per-session lock immediately or waits on that lock to become the successor.
+This applies to draining, direct foreground, and pen owners alike: a kick cannot
+exit merely because the current worker looks healthy, since that worker may
+fail after the enqueue and deliberately leave later inputs pending. No SQLite
+transaction is held while a kick waits on the OS lock.
+
+The lock owner checks for pending or open work before registering itself,
+starts one generation, recovers an interrupted operation, then drains pending
+inputs in FIFO order under that same lock. For every input it rebuilds the
+current transcript and cumulative usage, constructs a fresh agent and
+`StoreJournal::for_input`, restores the input's sandbox policy, and sends the
+exact queued user text. After a successful input, pending-read versus worker
+retirement is one IMMEDIATE transaction. Every successful enqueue launches a
+kick; redundant kicks serialize on the same lock and exit quickly after the
+queue is drained. The enqueue cannot race an empty worker into silently
+retiring past the input.
+
+The first input failure marks the worker failed and stops the drain, leaving
+later inputs pending. Normal empty completion uses the atomic drain-or-retire
+transition rather than an unconditional finish. Spawn success means only that
+the kick launched; a spawn or post-spawn startup failure leaves the new input
+pending until another explicit kick. The honest daemonless limitation is a
+caller crash after enqueue commits but before it attempts the spawn: no daemon
+notices the pending row, so another background or dashboard dispatch must
+provide the next kick.
 
 ### The durability rule
 
@@ -332,7 +369,7 @@ that survives the UI.
 ## Resource bounds (v0)
 
 | Resource | Bound |
-|---|--- |
+| --- | --- |
 | Provider turns per send | 500 (fuse, not budget) |
 | Tool result in transcript | 256 KiB |
 | bash timeout | 120 s default, 600 s max |

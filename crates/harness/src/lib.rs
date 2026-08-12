@@ -16,8 +16,13 @@ pub use pen::{PenConfig, PenTool};
 
 use bullpen_agent::{Journal, JournalError, RunOutcome, ToolIntent};
 use bullpen_llm::{Message, Usage};
-use bullpen_store::{Recovery, Store, StoreError, recover, title_from};
+use bullpen_store::{
+    DrainDecision, Recovery, SessionInput, SessionWorker, Store, StoreError, WorkerError, recover,
+    title_from,
+};
 use serde_json::json;
+use std::future::Future;
+use std::path::Path;
 
 /// Recover a session if it has a crashed run, then return the transcript
 /// and cumulative usage to seed the agent with.
@@ -28,6 +33,45 @@ pub fn prepare_session(
     let recovery = recover(store, session_id)?;
     let messages = store.path_messages(session_id)?;
     Ok((messages, recovery))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DrainInputsError<E> {
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+    #[error("session input failed: {0}")]
+    Input(E),
+}
+
+/// Drain a session's durable inbox serially while retaining one worker lock.
+///
+/// The runner is invoked once for each oldest pending input. After a failure,
+/// the worker is marked failed and no later input is touched. Empty completion
+/// retires through the store's atomic pending-or-retire decision.
+pub async fn drain_session_inputs<F, Fut, E>(
+    db_path: &Path,
+    worker: &mut SessionWorker,
+    mut run_input: F,
+) -> Result<(), DrainInputsError<E>>
+where
+    F: FnMut(SessionInput) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    loop {
+        let decision = {
+            let mut store = Store::open(db_path).map_err(WorkerError::from)?;
+            worker.drain_or_retire(&mut store, "completed")?
+        };
+        match decision {
+            DrainDecision::Pending(input) => {
+                if let Err(error) = run_input(input).await {
+                    worker.finish("failed")?;
+                    return Err(DrainInputsError::Input(error));
+                }
+            }
+            DrainDecision::Retired => return Ok(()),
+        }
+    }
 }
 
 /// SQLite-backed [`Journal`]. Owns the store for the duration of a run.
@@ -285,7 +329,7 @@ mod tests {
         }
     }
 
-    fn agent_with(store: Store, session_id: &str, provider: Arc<FakeProvider>) -> Agent {
+    fn base_agent(provider: Arc<FakeProvider>) -> Agent {
         let mut registry = Registry::new();
         registry.register(Arc::new(Echo));
         Agent::new(
@@ -298,7 +342,21 @@ mod tests {
                 ..Default::default()
             },
         )
-        .with_journal(Box::new(StoreJournal::new(store, session_id)))
+    }
+
+    fn agent_with(store: Store, session_id: &str, provider: Arc<FakeProvider>) -> Agent {
+        base_agent(provider).with_journal(Box::new(StoreJournal::new(store, session_id)))
+    }
+
+    fn queued_agent(
+        store: Store,
+        session_id: &str,
+        input_id: &str,
+        provider: Arc<FakeProvider>,
+    ) -> Agent {
+        base_agent(provider).with_journal(Box::new(StoreJournal::for_input(
+            store, session_id, input_id,
+        )))
     }
 
     fn open_store(dir: &tempfile::TempDir) -> Store {
@@ -431,6 +489,140 @@ mod tests {
         );
         assert!(store.open_run(&session.id).unwrap().is_none());
         assert!(store.path_messages(&session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_loop_runs_fifo_with_cumulative_transcript_and_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = Store::open(&db).unwrap();
+        let session = store.create_session("/tmp", "fake", "test").unwrap();
+        for (id, text) in [("input-1", "first"), ("input-2", "second")] {
+            store
+                .enqueue_input(
+                    &session.id,
+                    id,
+                    &serde_json::to_value(Message::user_text(text)).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut worker = SessionWorker::acquire(&db, &session.id).unwrap();
+        worker.start(&mut store).unwrap();
+        drop(store);
+
+        let provider = FakeProvider::new(vec![
+            response(
+                vec![ContentBlock::Text {
+                    text: "answer one".into(),
+                }],
+                StopReason::EndTurn,
+            ),
+            response(
+                vec![ContentBlock::Text {
+                    text: "answer two".into(),
+                }],
+                StopReason::EndTurn,
+            ),
+        ]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        drain_session_inputs(&db, &mut worker, {
+            let provider = provider.clone();
+            let seen = seen.clone();
+            let db = db.clone();
+            let session_id = session.id.clone();
+            move |input| {
+                let provider = provider.clone();
+                let seen = seen.clone();
+                let db = db.clone();
+                let session_id = session_id.clone();
+                async move {
+                    let mut store = Store::open(&db).unwrap();
+                    let (messages, _) = prepare_session(&mut store, &session_id).unwrap();
+                    let usage = store.get_session(&session_id).unwrap().usage;
+                    seen.lock().unwrap().push((
+                        input.id.clone(),
+                        messages.iter().map(Message::text).collect::<Vec<_>>(),
+                        usage,
+                    ));
+                    let prompt: Message = serde_json::from_value(input.prompt.clone()).unwrap();
+                    let mut agent =
+                        queued_agent(Store::open(&db).unwrap(), &session_id, &input.id, provider)
+                            .with_transcript(messages, usage);
+                    agent.send(prompt.text()).await.map(|_| ())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "input-1");
+        assert!(seen[0].1.is_empty());
+        assert_eq!(seen[0].2, Usage::default());
+        assert_eq!(seen[1].0, "input-2");
+        assert_eq!(seen[1].1, vec!["first", "answer one"]);
+        assert_eq!(seen[1].2.output_tokens, 5);
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .path_messages(&session.id)
+                .unwrap()
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["first", "answer one", "second", "answer two"]
+        );
+        assert_eq!(store.get_session(&session.id).unwrap().status, "completed");
+    }
+
+    #[tokio::test]
+    async fn drain_loop_stops_after_first_failure_and_leaves_later_input_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = Store::open(&db).unwrap();
+        let session = store.create_session("/tmp", "fake", "test").unwrap();
+        for (id, text) in [("input-1", "fail"), ("input-2", "later")] {
+            store
+                .enqueue_input(
+                    &session.id,
+                    id,
+                    &serde_json::to_value(Message::user_text(text)).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut worker = SessionWorker::acquire(&db, &session.id).unwrap();
+        worker.start(&mut store).unwrap();
+        drop(store);
+
+        let error = drain_session_inputs(&db, &mut worker, {
+            let db = db.clone();
+            move |input| {
+                let db = db.clone();
+                async move {
+                    let mut journal = StoreJournal::for_input(
+                        Store::open(&db).unwrap(),
+                        &input.session_id,
+                        &input.id,
+                    );
+                    let message: Message = serde_json::from_value(input.prompt).unwrap();
+                    journal.run_started(&message).await.unwrap();
+                    journal
+                        .run_finished(RunOutcome::Failed, Usage::default())
+                        .await
+                        .unwrap();
+                    Err::<(), _>("provider failed")
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DrainInputsError::Input("provider failed")));
+
+        let store = Store::open(&db).unwrap();
+        let inputs = store.list_inputs(&session.id).unwrap();
+        assert_eq!(inputs[0].state, bullpen_store::SessionInputState::Started);
+        assert_eq!(inputs[1].state, bullpen_store::SessionInputState::Pending);
+        assert_eq!(store.get_session(&session.id).unwrap().status, "failed");
     }
 
     #[tokio::test]
