@@ -1,0 +1,5 @@
+# Files
+
+- [Event and streaming model — Events out, assistant text on a separate TextSink](event-and-streaming-model.md) - The loop emits Event values on an optional channel that rendering consumes outside the loop; assistant text streams live on a separate TextSink so the CLI prints tokens to stdout while tool activity goes to stderr. A gone subscriber never stops the loop.
+- [Providers and auth — the five-provider selection matrix](providers-and-auth.md) - How a provider is chosen at CLI build_provider time, the three wire formats (Anthropic messages, OpenAI Responses/SSE, OpenAI chat-completions) covering five providers, and the two credential shapes with their refresh semantics.
+- [Transcript invariants — every tool_use gets one paired tool_result](transcript-invariants.md) - The four invariants the agent loop enforces on the transcript so it is always structurally valid for the next provider call, including after the max-turns fuse trips and after recovery synthesizes interrupted results.
