@@ -14,8 +14,8 @@ what bullpen ships today, and in what order the rest should land.
 | Tool | Catalog role | Notes |
 |---|---|---|
 | `bash` | runtime shell | Serial, sandboxable (Seatbelt on macOS), timeout-bounded. |
-| `read_file` | read | Workspace-relative, output capped head+tail. |
-| `write_file` / `edit_file` | write / edit | Sandbox write-confinement applies. |
+| `read_file` | read | Workspace-relative, output capped head+tail. Hashline output: every line carries a `line#hash` anchor. |
+| `write_file` / `edit_file` | write / edit | Sandbox write-confinement applies. `edit_file` takes exact-string replacements or hashline patches — hunks addressed by anchors, spans via `to`, with stale-anchor recovery: a moved line is followed while its content hash is unique, a changed line fails with fresh context instead of misapplying. |
 | `grep` | content search | Regex over the tree, `.gitignore`-aware. |
 | `glob` | path find | Pattern lookup; reach for `grep` when you need content. |
 | `agent` | task fan-out | The pen: durable child sessions, deterministic ids, reattach-on-replay, durable child budget. `worktree: true` isolates a work child in its own git worktree on its own branch; `background: true` dispatches and returns immediately. Inspect, isolated, and background children all run in parallel. |
@@ -37,10 +37,6 @@ names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
 
 ## Then: files & search, deepened
 
-- **hashline `edit`** — content-hash anchors with stale-anchor recovery,
-  replacing brittle exact-string matching. Pairs naturally with the
-  durability model: an anchor is an intent that can be revalidated on
-  replay.
 - **`ast_grep` / `ast_edit`** — structural queries and previewed rewrites
   by shelling out to [ast-grep]. Preview-then-apply maps onto intent
   records: the preview is durable, the apply is a separate confirmed step
