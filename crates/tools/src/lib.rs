@@ -5,11 +5,13 @@
 //! the parallel-safety decision via [`Tool::parallel_safe`].
 
 mod ask;
+mod ast;
 mod bash;
 mod fs;
 mod search;
 
 pub use ask::{Ask, Asker};
+pub use ast::{AstEdit, AstGrep};
 pub use bash::Bash;
 pub use fs::{EditFile, ReadFile, WriteFile};
 pub use search::{Glob, Grep};
@@ -112,7 +114,8 @@ impl Registry {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
-    /// The standard workspace registry: shell, file I/O, and search.
+    /// The standard workspace registry: shell, file I/O, and search — both
+    /// textual and structural.
     pub fn standard() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(Bash));
@@ -121,6 +124,8 @@ impl Registry {
         r.register(Arc::new(EditFile));
         r.register(Arc::new(Grep));
         r.register(Arc::new(Glob));
+        r.register(Arc::new(AstGrep::new()));
+        r.register(Arc::new(AstEdit::new()));
         r
     }
 }
@@ -179,6 +184,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "ast_edit",
+                "ast_grep",
                 "bash",
                 "edit_file",
                 "glob",

@@ -32,7 +32,7 @@ use std::time::Duration;
 use bullpen_agent::{Agent, AgentConfig};
 use bullpen_llm::{Provider, Role, ToolSpec};
 use bullpen_store::{Session, SessionWorker, Store};
-use bullpen_tools::{Glob, Grep, ReadFile, Registry, Tool, ToolCtx, ToolError};
+use bullpen_tools::{AstGrep, Glob, Grep, ReadFile, Registry, Tool, ToolCtx, ToolError};
 use serde_json::{Value, json};
 
 use crate::{StoreJournal, prepare_session, worktree};
@@ -187,6 +187,7 @@ fn registry_for_mode(mode: &str) -> Result<Registry, ToolError> {
             r.register(Arc::new(ReadFile));
             r.register(Arc::new(Grep));
             r.register(Arc::new(Glob));
+            r.register(Arc::new(AstGrep::new()));
             Ok(r)
         }
         // Full workspace tools — still no nested pen.

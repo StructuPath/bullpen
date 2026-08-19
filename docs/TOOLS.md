@@ -22,6 +22,7 @@ what bullpen ships today, and in what order the rest should land.
 | `job` | background coordination | The coordination plane, exposed to the model: `list` children with store-derived state (status + pid liveness), `wait` polls to a terminal state and returns the child's answer, `cancel` signals a background child — which finishes as failed and stays resumable. |
 | `todo` | session plan | Durable todo list in the store; replay-safe via deterministic item ids; the store enforces one item in progress at a time. |
 | `ask` | follow-up questions | Transport-agnostic: interactive runs answer from the terminal, detached runs (background, `--json`, piped) fail the call with the reason instead of blocking forever. Numbered options resolve to their text. |
+| `ast_grep` / `ast_edit` | structural search / rewrite | Shell out to the [ast-grep] binary, discovered at call time (`ast-grep`, then `sg`, verified by `--version`); absence is a clear error with an install hint. `ast_edit` previews the diff by default and writes only on `apply: true` — the catalog's preview-then-resolve, folded into one tool. Applies run through the sandbox's shell wrapper, like `bash`. |
 
 Two catalog entries cost nothing because they already exist under other
 names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
@@ -37,10 +38,6 @@ names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
 
 ## Then: files & search, deepened
 
-- **`ast_grep` / `ast_edit`** — structural queries and previewed rewrites
-  by shelling out to [ast-grep]. Preview-then-apply maps onto intent
-  records: the preview is durable, the apply is a separate confirmed step
-  (the catalog's `resolve`).
 - **richer `read`** — directories and URLs are in; archives, SQLite, and
   PDFs remain, each an incremental, independently testable decoder behind
   the existing tool.
