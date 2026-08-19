@@ -55,7 +55,10 @@ struct Entry {
     is_dir: bool,
 }
 
-fn render(path: &Path, kind: Kind, entries: Vec<Entry>) -> String {
+/// `total` counts every member scanned; `entries` holds at most
+/// [`MAX_ENTRIES`] of them — the cap is applied while scanning, so a
+/// million-member archive costs a count, not a vector.
+fn render(path: &Path, kind: Kind, entries: Vec<Entry>, total: usize) -> String {
     let label = match kind {
         Kind::Zip => "zip",
         Kind::Tar => "tar",
@@ -64,19 +67,18 @@ fn render(path: &Path, kind: Kind, entries: Vec<Entry>) -> String {
     if entries.is_empty() {
         return format!("(empty {label} archive {})", path.display());
     }
-    let total = entries.len();
     let mut out = format!(
         "{label} archive {} ({total} entries) — pass `entry` to read one:\n",
         path.display()
     );
-    for entry in entries.iter().take(MAX_ENTRIES) {
+    for entry in &entries {
         if entry.is_dir {
             out.push_str(&format!("  {}\n", entry.name));
         } else {
             out.push_str(&format!("  {}  {} bytes\n", entry.name, entry.size));
         }
     }
-    if total > MAX_ENTRIES {
+    if total > entries.len() {
         out.push_str(&format!("[listed the first {MAX_ENTRIES}]\n"));
     }
     out
@@ -109,11 +111,12 @@ fn tar_archive(path: &Path, kind: Kind) -> Result<tar::Archive<Box<dyn Read>>, T
 
 /// The listing view.
 pub(crate) fn list(path: &Path, kind: Kind) -> Result<String, ToolError> {
-    let entries = match kind {
+    let (entries, total) = match kind {
         Kind::Zip => {
             let mut archive = zip_archive(path)?;
+            let total = archive.len();
             let mut entries = Vec::new();
-            for i in 0..archive.len() {
+            for i in 0..total.min(MAX_ENTRIES) {
                 let member = archive.by_index(i).map_err(|e| arch_err(path, e))?;
                 entries.push(Entry {
                     name: member.name().to_string(),
@@ -121,27 +124,31 @@ pub(crate) fn list(path: &Path, kind: Kind) -> Result<String, ToolError> {
                     is_dir: member.is_dir(),
                 });
             }
-            entries
+            (entries, total)
         }
         Kind::Tar | Kind::TarGz => {
             let mut archive = tar_archive(path, kind)?;
             let mut entries = Vec::new();
+            let mut total = 0;
             for member in archive.entries().map_err(|e| arch_err(path, e))? {
                 let member = member.map_err(|e| arch_err(path, e))?;
-                entries.push(Entry {
-                    name: member
-                        .path()
-                        .map_err(|e| arch_err(path, e))?
-                        .display()
-                        .to_string(),
-                    size: member.size(),
-                    is_dir: member.header().entry_type().is_dir(),
-                });
+                total += 1;
+                if entries.len() < MAX_ENTRIES {
+                    entries.push(Entry {
+                        name: member
+                            .path()
+                            .map_err(|e| arch_err(path, e))?
+                            .display()
+                            .to_string(),
+                        size: member.size(),
+                        is_dir: member.header().entry_type().is_dir(),
+                    });
+                }
             }
-            entries
+            (entries, total)
         }
     };
-    Ok(render(path, kind, entries))
+    Ok(render(path, kind, entries, total))
 }
 
 /// Extract one member's bytes (bounded). The name must match a listed
@@ -151,6 +158,13 @@ pub(crate) fn read_entry(
     kind: Kind,
     entry: &str,
 ) -> Result<(Vec<u8>, bool), ToolError> {
+    if entry.is_empty() {
+        return Err(ToolError::InvalidInput(
+            "`entry` must name an archive member — read the archive without \
+             `entry` to list them"
+                .into(),
+        ));
+    }
     let missing = || {
         ToolError::InvalidInput(format!(
             "no entry `{entry}` in {} — read the archive without `entry` to list them",
@@ -288,6 +302,41 @@ mod tests {
         let err = read_entry(&zip, Kind::Zip, "nope.txt").unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)), "{err}");
         assert!(err.to_string().contains("without `entry`"), "{err}");
+    }
+
+    #[test]
+    fn listings_cap_what_they_keep_but_count_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        for i in 0..(MAX_ENTRIES + 5) {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("f{i:04}.txt"), &b"x"[..])
+                .unwrap();
+        }
+        builder.finish().unwrap();
+
+        let out = list(&path, Kind::Tar).unwrap();
+        assert!(
+            out.contains(&format!("({} entries)", MAX_ENTRIES + 5)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("[listed the first {MAX_ENTRIES}]")),
+            "{out}"
+        );
+        assert!(!out.contains("f1002.txt"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_entry_name_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_entry(&make_zip(&dir), Kind::Zip, "").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "{err}");
     }
 
     #[test]

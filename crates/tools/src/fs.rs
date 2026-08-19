@@ -96,9 +96,8 @@ impl Tool for ReadFile {
                 .get("query")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let db = path.clone();
             return tokio::task::spawn_blocking(move || {
-                crate::sqlite::read_sqlite(&db, query.as_deref())
+                crate::sqlite::read_sqlite(&path, query.as_deref())
             })
             .await
             .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
@@ -108,11 +107,10 @@ impl Tool for ReadFile {
                 .get("entry")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let archive = path.clone();
             return tokio::task::spawn_blocking(move || match entry {
-                None => crate::archive::list(&archive, kind),
+                None => crate::archive::list(&path, kind),
                 Some(entry) => {
-                    let (bytes, clipped) = crate::archive::read_entry(&archive, kind, &entry)?;
+                    let (bytes, clipped) = crate::archive::read_entry(&path, kind, &entry)?;
                     let text = String::from_utf8_lossy(&bytes);
                     let lines: Vec<&str> = text.lines().collect();
                     let mut out = hashlines(&lines, 1, usize::MAX);
