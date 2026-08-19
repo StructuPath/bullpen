@@ -47,21 +47,25 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read through one path: a file, a directory, or an \
-                          http(s) URL. Files render as 1-indexed \
+            description: "Read through one path: a file, a directory, a SQLite \
+                          database, or an http(s) URL. Files render as 1-indexed \
                           `line#hash<TAB>content`, capped at 256 KiB — the \
                           `line#hash` token is an anchor that `edit_file` \
                           patches accept — with an optional line window. \
-                          Directories render a sorted listing. URLs are \
-                          fetched with GET (capped, 30s timeout); a sandbox \
-                          that denies network refuses them."
+                          Directories render a sorted listing. A SQLite file \
+                          (detected by content) renders its schema and row \
+                          counts, or runs a read-only `query` (writes are \
+                          rejected by the engine). URLs are fetched with GET \
+                          (capped, 30s timeout); a sandbox that denies network \
+                          refuses them."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File or directory path, or an http(s):// URL"},
+                    "path": {"type": "string", "description": "File, directory, or SQLite path, or an http(s):// URL"},
                     "offset": {"type": "integer", "description": "1-indexed first line (files only)"},
-                    "limit": {"type": "integer", "description": "Max lines to return (files only)"}
+                    "limit": {"type": "integer", "description": "Max lines to return (files only)"},
+                    "query": {"type": "string", "description": "Read-only SQL to run (SQLite files only)"}
                 },
                 "required": ["path"]
             }),
@@ -84,6 +88,18 @@ impl Tool for ReadFile {
         let path = resolve_path(ctx, raw_path);
         if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
             return list_dir(&path).await;
+        }
+        if crate::sqlite::is_sqlite(&path) {
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let db = path.clone();
+            return tokio::task::spawn_blocking(move || {
+                crate::sqlite::read_sqlite(&db, query.as_deref())
+            })
+            .await
+            .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
         }
         let raw = tokio::fs::read(&path)
             .await
@@ -821,6 +837,35 @@ mod tests {
             &lines[1..],
             ["  sub/", "  a.txt  1 bytes", "  b.txt  5 bytes"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_sqlite_database_reads_as_schema_then_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        let conn = rusqlite::Connection::open(dir.path().join("s.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parts (id INTEGER PRIMARY KEY, sku TEXT);
+             INSERT INTO parts (sku) VALUES ('W12x26');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "s.db"}))
+            .await
+            .unwrap();
+        assert!(out.contains("parts (1 rows): id, sku"), "{out}");
+
+        let out = ReadFile
+            .run(
+                &c,
+                "t",
+                json!({"path": "s.db", "query": "SELECT sku FROM parts"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("W12x26"), "{out}");
     }
 
     /// One canned HTTP exchange on a local port; returns the URL to hit.
