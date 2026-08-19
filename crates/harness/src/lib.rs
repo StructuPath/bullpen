@@ -6,7 +6,9 @@
 //! idempotent. [`prepare_session`] is the front door: recover if a previous
 //! process died mid-run, then hand back the rebuilt transcript.
 //!
-//! This crate is the future home of the pen (durable subagents).
+//! This crate also hosts the session-scoped tools that need the store:
+//! the pen (durable subagents), `job` (the coordination plane), `todo`
+//! (the durable session plan), and worktree placement.
 
 pub mod job;
 pub mod pen;

@@ -156,7 +156,7 @@ directly in it, with no `.bullpen` segment appended.
 
 | | |
 |---|---|
-| ✅ Shipped | Durable execution + crash recovery · the pen (durable subagents) · write-confinement sandbox with Seatbelt on macOS · agent view (dispatch, peek, live state) · 5 providers |
+| ✅ Shipped | Durable execution + crash recovery · the pen (durable subagents, worktree isolation, background dispatch + `job`) · hashline edits with anchor recovery · durable session plans (`todo`) · follow-up questions (`ask`) · write-confinement sandbox with Seatbelt on macOS · agent view (dispatch, peek, live state) · 5 providers |
 | 🚧 Next | Interactive attach to a live session · needs-input state · notifications · compaction |
 | 📋 Planned | Landlock confinement on Linux · a durable workflow engine (steps in SQLite, resumable from any step) |
 

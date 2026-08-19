@@ -31,10 +31,10 @@ crates above it in this table:
 |---|---|---|
 | `bullpen-llm` | Provider-neutral conversation types, `Provider` trait, wire-format adapters (Anthropic messages, OpenAI chat-completions, Codex Responses/SSE), shared retry policy | Tools, transcripts, UI |
 | `bullpen-auth` | Credential store (`~/.bullpen/auth.json` or `$BULLPEN_HOME/auth.json`, 0600, atomic), PKCE, OpenRouter OAuth, Codex device-code flow + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
-| `bullpen-tools` | `Tool` trait, `Registry`, built-ins (bash, read/write/edit, grep, glob), parallel-safety flags | Providers, the loop |
+| `bullpen-tools` | `Tool` trait, `Registry`, built-ins (bash, hashline read/write/edit, grep, glob, ask), parallel-safety flags | Providers, the loop |
 | `bullpen-store` | SQLite persistence: sessions, transcripts, usage; schema migrations via `user_version` | Providers, tools, the loop |
 | `bullpen-agent` | The loop: transcript, provider calls, tool continuation, events, max-turns fuse, the `Journal` durability protocol (trait only) | Config files, sessions, vendors, UI, storage |
-| `bullpen-harness` | Durable execution: `StoreJournal` (implements `Journal` over the store), crash recovery orchestration; future home of the pen | Vendors, UI |
+| `bullpen-harness` | Durable execution: `StoreJournal` (implements `Journal` over the store), crash recovery orchestration; the pen (durable subagents), `job`, `todo`, worktree placement | Vendors, UI |
 | `bullpen` (cli) | Composition root: wiring, system prompt, headless `run`, `sessions` | — (the only crate that knows everything) |
 
 The rule that makes the table above enforceable, kept absolute: **the core
@@ -232,7 +232,7 @@ Milestones, in order. Each lands as its own crate or a bounded extension:
   request order. `Tool::parallel_safe` judges the concrete input — the
   runtime owns the decision, never the model. Read/grep/glob are
   parallel-safe; bash and writes are serial; the `agent` tool is
-  parallel-safe only in `inspect` mode. Durability is unchanged by
+  parallel-safe for `inspect`, worktree-isolated, and background children. Durability is unchanged by
   scheduling: the whole batch's intents are journaled before any execution,
   and a crash mid-batch synthesizes the whole batch on recovery. Still open
   for M2.x: live child event streaming to the parent's UI, token budgets
