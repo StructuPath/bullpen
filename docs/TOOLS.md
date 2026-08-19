@@ -23,6 +23,7 @@ what bullpen ships today, and in what order the rest should land.
 | `todo` | session plan | Durable todo list in the store; replay-safe via deterministic item ids; the store enforces one item in progress at a time. |
 | `ask` | follow-up questions | Transport-agnostic: interactive runs answer from the terminal, detached runs (background, `--json`, piped) fail the call with the reason instead of blocking forever. Numbered options resolve to their text. |
 | `ast_grep` / `ast_edit` | structural search / rewrite | Shell out to the [ast-grep] binary, discovered at call time (`ast-grep`, then `sg`, verified by `--version`); absence is a clear error with an install hint. `ast_edit` previews the diff by default and writes only on `apply: true` — the catalog's preview-then-resolve, folded into one tool. Applies run through the sandbox's shell wrapper, like `bash`. |
+| `github` | GitHub CLI ops | Raw `gh` arguments as an array, no shell in between. The runtime derives parallel safety from the verb (views/lists/diffs/checks ride together, mutations and `api` stay serial), a network-denying sandbox refuses the call, and a missing binary errors with the install + `gh auth login` hint. Registered on top-level runs only — pen children keep to the workspace. |
 
 Two catalog entries cost nothing because they already exist under other
 names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
@@ -47,7 +48,6 @@ names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
 Each of these wraps a proven external surface; the work is inputs,
 sandbox policy, and output discipline, not invention.
 
-- **`github`** — `gh` CLI operations (repo, PR, issues, run-watch).
 - **`web_search`** — provider-backed search (page retrieval already ships
   as URL reads). `--sandbox-strict` (network cut) must disable it cleanly,
   as it already does for URL reads.

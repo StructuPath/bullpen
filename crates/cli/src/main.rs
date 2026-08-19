@@ -598,6 +598,9 @@ async fn run(
         Store::default_path(),
         &session.id,
     )));
+    // GitHub, with the user's own gh login. Top-level runs only — pen
+    // children keep to the workspace unless the coordinator acts itself.
+    registry.register(std::sync::Arc::new(bullpen_tools::GitHub::new()));
     // Follow-up questions reach the terminal only when someone is on it;
     // otherwise the detached variant answers with the reason instead.
     let interactive = !json && std::io::IsTerminal::is_terminal(&std::io::stdin());

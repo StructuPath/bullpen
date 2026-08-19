@@ -134,6 +134,7 @@ crash-recoverable and inspectable from the CLI the whole way.
 | `write_file` / `edit_file` | Writes under sandbox confinement; edits by exact string or by anchored hashline patch with stale-anchor recovery |
 | `grep` / `glob` | Regex content search and path patterns, `.gitignore`-aware |
 | `ast_grep` / `ast_edit` | Structural search and rewrite over the syntax tree via [ast-grep](https://ast-grep.github.io) (when installed); rewrites preview by default and write only on `apply: true` |
+| `github` | GitHub CLI operations with your own `gh` login (when installed) — reads run in parallel, mutations stay serial |
 | `agent` | The pen: delegate to durable child agents (above) |
 | `job` | The coordination plane: list children with live state, wait for a result, cancel a background child |
 | `todo` | A durable session plan in the store — survives crashes and resumes; one item in progress at a time, enforced by the runtime |

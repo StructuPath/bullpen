@@ -8,12 +8,14 @@ mod ask;
 mod ast;
 mod bash;
 mod fs;
+mod github;
 mod search;
 
 pub use ask::{Ask, Asker};
 pub use ast::{AstEdit, AstGrep};
 pub use bash::Bash;
 pub use fs::{EditFile, ReadFile, WriteFile};
+pub use github::GitHub;
 pub use search::{Glob, Grep};
 
 use std::collections::BTreeMap;
