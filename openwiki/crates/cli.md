@@ -15,11 +15,12 @@ together. Core crates never reach up into here.
 ## Module layout
 
 - `main.rs` — `Cli`/`Command` (clap), provider construction, login flows,
-  the `run` command, `logs`, `sessions`
+  the `run` command, `logs`, `sessions`, `TtyAsker` (the `Asker` impl)
 - [`agents.rs`](cli-background.md) — the `bullpen agents` dashboard
 - [`bg.rs`](cli-background.md) — background dispatch + liveness
 - [`json.rs`](cli-run-json.md) — the `--json` NDJSON event stream
-- [`worktree.rs`](worktree.md) — per-session git worktrees
+- [`worktree.rs`](worktree.md) — now in [`bullpen-harness`](harness.md); the
+  CLI imports it as `bullpen_harness::worktree`
 
 ## Commands (`Command`)
 
@@ -110,9 +111,14 @@ names.
    so the agent still takes its streaming path).
 9. **Build the tool ctx** (with sandbox), the `StoreJournal` (its own store
    handle; WAL-safe), and the **pen config** (with sandbox). Register
-   `Registry::standard()` plus `PenTool::new(provider, &session.id, pen_config)`.
-   Construct the `Agent` with `.with_transcript(transcript, usage)`,
-   `.with_events(tx)`, `.with_delta_sink(delta_tx)`, `.with_journal(journal)`.
+   `Registry::standard()` (bash, read/write/edit, grep, glob, ast_grep,
+   ast_edit) plus the session-scoped tools: `pen.job_tool()` (the `job` tool,
+   sharing the pen's cancel registry) and `pen` (the `agent` tool), then
+   `TodoTool::new(Store::default_path(), &session.id)` (the `todo` tool),
+   `GitHub::new()` (the `github` tool — top-level runs only), and `Ask`
+   (interactive if stdin is a terminal, otherwise detached). Construct the
+   `Agent` with `.with_transcript(transcript, usage)`, `.with_events(tx)`,
+   `.with_delta_sink(delta_tx)`, `.with_journal(journal)`.
 10. `agent.send(&prompt)`. Drop the agent (so the receiver loops can end),
     await the printer and streamer.
 11. `session_worker.finish("completed"|"failed")` (records terminal state
@@ -124,6 +130,16 @@ names.
 owned by the CLI so the store stays free of presentation concerns (full
 session ids, not the display prefix).
 
+## `TtyAsker`
+
+The CLI's [`bullpen_tools::Asker`](tools.md) impl for the `ask` tool: the
+question goes to **stderr** (never the answer stream on stdout) and the reply
+is one line from the terminal, read on `spawn_blocking` so it blocks a worker
+thread, not the runtime. `Ask::interactive(Arc<TtyAsker>)` is registered when
+stdin is a terminal; `Ask::detached()` otherwise (background, `--json`,
+piped), which fails the call with the reason rather than blocking on input
+nobody will type.
+
 ## Focused tests
 
 - `empty_session_list_serializes_to_empty_array` /
@@ -133,6 +149,7 @@ session ids, not the display prefix).
 
 See [cli-background](cli-background.md) for the dashboard and background
 dispatch, [cli-run-json](cli-run-json.md) for the NDJSON event stream,
-[worktree](worktree.md) for per-session git worktrees, and
+[worktree](worktree.md) for per-session git worktrees, [the pen](pen.md) and
+[job](job.md) and [todo](todo.md) for the session-scoped tools, and
 [providers and auth](../concepts/providers-and-auth.md) for the provider/auth
 selection matrix.

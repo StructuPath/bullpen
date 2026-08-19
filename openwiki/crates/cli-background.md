@@ -17,8 +17,10 @@ these processes directly — which is why they survive it closing.
 
 - `log_path(session_id)` → `$BULLPEN_HOME/logs/<id>.log` (where a background
   session's stdout/stderr is captured).
-- `pid_alive(pid)` — `kill(pid, 0)`; success or `EPERM` both mean the process
-  exists. Returns `false` for `pid <= 0`.
+- `pid_alive` — re-exported from [`bullpen_store::status`](store.md); `kill(pid, 0)`;
+  success or `EPERM` both mean the process exists, `pid <= 0` → false. Lives in
+  the store so the agents dashboard (below) and the [job tool](job.md) share one
+  check.
 - `spawn_detached(session_id, prompt, extra_args) -> io::Result<u32>` — creates
   the logs dir, opens the log as stdout+stderr, re-execs
   `bullpen run --resume <id> <prompt>` with the `extra_args` (e.g.

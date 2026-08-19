@@ -1,24 +1,35 @@
 ---
 type: crate
 title: bullpen-harness — durable execution composition of the loop and the store
-description: The StoreJournal implementing the agent Journal over SQLite, prepare_session recovering then rebuilding the transcript, and the PenTool durable subagents.
-tags: [harness, storejournal, durable-execution, pen, prepare-session]
+description: The StoreJournal implementing the agent Journal over SQLite, prepare_session recovering then rebuilding the transcript, the PenTool durable subagents (worktree isolation + background dispatch), the job coordination tool, the todo durable session plan, and worktree placement.
+tags: [harness, storejournal, durable-execution, pen, job, todo, worktree, prepare-session]
 ---
 
 # `bullpen-harness`
 
 `crates/harness/Cargo.toml` dependencies: `bullpen-agent`, `bullpen-store`,
-`bullpen-llm`, `bullpen-tools`, `bullpen-sandbox`, `async-trait`, `tokio`,
-`uuid`, `serde_json`, `tempfile` (dev). It knows nothing about vendors or UI.
+`bullpen-llm`, `bullpen-tools`, `bullpen-sandbox`, `anyhow`, `async-trait`,
+`tokio`, `uuid`, `serde_json`, `tempfile` (dev). It knows nothing about vendors
+or UI.
 
 This crate is where durable execution is composed: the agent loop's
 [`Journal`](agent.md) protocol implemented over the SQLite [store](store.md).
+It also hosts the session-scoped tools that need the store: the [pen](pen.md)
+(durable subagents), [job](job.md) (the coordination plane), [todo](todo.md)
+(the durable session plan), and [worktree](worktree.md) placement.
 
 ## Module layout
 
-- `lib.rs` — `StoreJournal`, `prepare_session`
-- [`pen.rs`](pen.md) — the `agent` tool (durable subagents)
+- `lib.rs` — `StoreJournal`, `prepare_session`; re-exports `JobTool`,
+  `PenConfig`/`PenTool`, `TodoTool`, and the `worktree` module
+- [`pen.rs`](pen.md) — the `agent` tool (durable subagents, worktree
+  isolation, background dispatch + cancellation)
+- [`job.rs`](job.md) — the `job` tool (list/wait/cancel over pen children)
+- [`todo.rs`](todo.md) — the `todo` tool (durable session plan in the store)
+- [`worktree.rs`](worktree.md) — per-session git worktree placement (moved
+  here from `crates/cli` so the pen can place work children)
 - `testutil.rs` (test-only) — shared `FakeProvider`/`response`/`text_response`
+  + `HangingProvider` (never resolves) for cancellation/liveness tests
 
 ## `prepare_session`
 
@@ -79,8 +90,23 @@ fails the run.
 spawns children as ordinary sessions in the same store with deterministic ids
 (`uuidv5(parent, tool_call_id)`), so a replayed spawn reattaches. `PenConfig`
 carries the store path, workspace, provider/model, system prompt, and the
-durable budgets (`max_children`, `child_timeout`, `child_max_turns`). See the
-[pen page](pen.md) for the full protocol.
+durable budgets (`max_children`, `child_timeout`, `child_max_turns`). Work
+children can be isolated (`worktree: true`) or dispatched to the background
+(`background: true`); background children are coordinated through the
+[`job` tool](job.md) via the shared `Cancels` registry. See the
+[pen page](pen.md) for the full protocol and [job](job.md) for the coordination
+plane.
+
+## The session-scoped tools
+
+- [`PenTool`](pen.md) — the `agent` tool; `PenTool::job_tool()` returns the
+  [`JobTool`](job.md) sharing the pen's cancel registry.
+- [`JobTool`](job.md) — `list`/`wait`/`cancel` over the session's pen children,
+  deriving state from the store + `pid_alive`.
+- [`TodoTool`](todo.md) — the `todo` tool; a durable plan in the store with
+  deterministic item ids and the one-active-item invariant.
+- [`worktree`](worktree.md) — per-session git worktree placement, used by the
+  pen (`place_child`) and the [CLI](cli.md) run path.
 
 ## Focused tests
 

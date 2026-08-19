@@ -7,10 +7,8 @@ tags: [transcript, invariants, tool-use-pairing, structural-validity]
 
 # Transcript invariants
 
-<!-- openwiki: broken internal link [agent.md] file "agent.md" does not exist. Fix the href or restore the target, then delete this comment. -->
-Enforced in [`bullpen-agent`](agent.md), tested in its unit suite and the
-<!-- openwiki: broken internal link [harness.md] file "harness.md" does not exist. Fix the href or restore the target, then delete this comment. -->
-[harness](harness.md) end-to-end tests. The transcript is the conversation
+Enforced in [`bullpen-agent`](../crates/agent.md), tested in its unit suite and the
+[`bullpen-harness`](../crates/harness.md) end-to-end tests. The transcript is the conversation
 the model sees; these invariants make it always structurally valid for the
 next provider call.
 
@@ -35,14 +33,12 @@ next provider call.
    `max_tokens_stop_is_distinct_error_with_partial`.
 
 4. **Tool results are capped (256 KiB) before entering the transcript.** The
-<!-- openwiki: broken internal link [cli-run-json.md] file "cli-run-json.md" does not exist. Fix the href or restore the target, then delete this comment. -->
-   same cap bounds tool payloads on the [CLI's JSON event stream](cli-run-json.md).
+   same cap bounds tool payloads on the [CLI's JSON event stream](../crates/cli-run-json.md).
    `cap_result` truncates on a char boundary with an inline marker.
 
 ## After recovery
 
-<!-- openwiki: broken internal link [recovery.md] file "recovery.md" does not exist. Fix the href or restore the target, then delete this comment. -->
-[Recovery](recovery.md) maintains these invariants for a crashed run: it
+[Recovery](../crates/recovery.md) maintains these invariants for a crashed run: it
 appends synthetic `interrupted` `ToolResult`s at the provisioned
 `results_entry_id` (so every `tool_use` from the interrupted batch still
 gets a paired result), and appends a closing assistant note if the transcript

@@ -23,7 +23,7 @@ loop.
 ## One database, two kinds of state
 
 `~/.bullpen/bullpen.db` (WAL mode, `busy_timeout` 10 s, `foreign_keys` ON),
-schema versioned by `pragma user_version` (v7). `BULLPEN_HOME` overrides the
+schema versioned by `pragma user_version` (v8). `BULLPEN_HOME` overrides the
 directory (see `home_dir`/`resolve_home` — an empty `BULLPEN_HOME` counts as
 unset). `Store::default_path()` is `home_dir().join("bullpen.db")`.
 
@@ -61,13 +61,15 @@ cannot repair that), and applies each version's batch guarded by
 - v5 — `sessions.status`, `sessions.pid` (background worker state)
 - v6 — `sessions.worktree_path`, `sessions.worktree_branch`
 - v7 — `sessions.worker_generation` (transient ownership token)
+- v8 — `todos` table (the durable session plan)
 
 Migration tests build old-shape databases by hand (`migrates_v2_sessions_into_entry_tree`,
-`migrates_v5_sessions_adding_worktree_columns`, `migrates_v6_sessions_adding_worker_generation`)
+`migrates_v5_sessions_adding_worktree_columns`, `migrates_v6_sessions_adding_worker_generation`,
+`migrates_v7_sessions_adding_todos`)
 and assert `Store::open` upgrades them into the current shape.
-`concurrent_first_open_serializes_the_v7_migration` opens the same pre-v7
+`concurrent_first_open_serializes_the_v8_migration` opens the same pre-v8
 database from two threads and asserts exactly one migration writes and both
-see `worker_generation` afterward — the `IMMEDIATE` recheck serializes them.
+see the `todos` table afterward — the `IMMEDIATE` recheck serializes them.
 
 ## `Session` row
 
@@ -87,6 +89,9 @@ liveness), `worktree_path`/`worktree_branch` (NULL for a shared-cwd session).
   `LIMIT 2`); `NotFound`/`Ambiguous` errors.
 - `list_sessions()` — `ORDER BY updated_at DESC`.
 - `count_children(parent_id)` — the durable child-count budget.
+- `list_children(parent_id)` — the session's pen children, oldest first
+  (`ORDER BY created_at, id`); used by the [job tool](job.md) to list children
+  with live state.
 - `update_session_meta(usage, title)` — rolls usage forward and sets the title
   if empty (first-user-message wins).
 - `set_worktree(path, branch)` — records the worktree location **before** it is
@@ -141,6 +146,25 @@ around these. The generation makes terminal status stale-safe.
   payload's `outcome`; used by the pen to recognize a completed child for
   reattachment.
 
+## Todos API (the session plan, v8)
+
+The `todos` table holds a session's durable plan — one row per item, with a
+caller-provisioned (deterministic) `id`, a `position`, `content`, and a
+`status` (`pending`/`in_progress`/`completed`). The [todo tool](todo.md) drives
+this; the store owns the invariants.
+
+- `add_todo(session_id, id, content)` — `append-if-missing` on the id at
+  `COALESCE(MAX(position), 0) + 1`; idempotent, so a replayed `add` converges.
+- `set_todo_status(session_id, prefix, status)` — resolves by id prefix; when
+  the target is `in_progress`, returns every other in-progress item to
+  `pending` (the one-active-item invariant). `Todo { id, position, content,
+  status }`.
+- `remove_todo(session_id, prefix)` — delete by id prefix.
+- `list_todos(session_id)` — `ORDER BY position`.
+
+`resolve_todo` mirrors session prefix resolution (`LIKE prefix || '%'`,
+`LIMIT 2`): zero → `NotFound`, two+ → `Ambiguous`.
+
 ## Derived dashboard state (`status.rs`)
 
 `AgentStatus` is `Idle | Working | Completed | Failed`. The raw `status` column
@@ -151,6 +175,13 @@ finished cleanly. `derive(status, alive)` is the pure function:
 `"running" + alive → Working`, `"running" + !alive → Failed` (crashed),
 `"completed" → Completed`, `"failed" → Failed`, else `Idle`. `group_rank()`
 orders the dashboard (Working, Idle, Failed, Completed).
+
+`for_session(session, alive)` pairs a `Session` row with the liveness bit —
+the function the [agents dashboard](cli-background.md) and the [job
+tool](job.md) both call. `pid_alive(pid)` is the liveness check itself:
+`kill(pid, 0)`, where success or `EPERM` both mean the process exists (and
+`pid <= 0` → false). It lives here (not `cli/bg.rs`) so the tool and the
+dashboard share one check.
 
 `title_from(messages)` extracts the first user message's text (first 80 chars)
 for the session title.
@@ -169,7 +200,14 @@ for the session title.
   `finish_operation` returns to `None`; finishing again is idempotent.
 - `seq_is_shared_and_monotonic_across_tables` — entries and records draw from
   one shared `seq` (entry seqs `[1, 3]`, record seq `2`).
-- The three migration tests noted above.
+- `todos_append_in_order_and_adds_are_idempotent` — a replayed `add` with the
+  same id is a no-op; positions are untouched.
+- `only_one_todo_is_ever_in_progress` — starting the second returns the first
+  to `pending` (the store-enforced invariant).
+- `todo_prefix_resolution_mirrors_sessions` — prefix resolution is
+  `NotFound`/`Ambiguous` like sessions.
+- The migration tests noted above.
 
 See [durable execution](../architecture/durable-execution.md) for the protocol
-and [recovery](recovery.md) for the procedure that consumes the reducer.
+and [recovery](recovery.md) for the procedure that consumes the reducer, and
+[todo](todo.md) for the tool that drives the plan.

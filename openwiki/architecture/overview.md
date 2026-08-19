@@ -37,10 +37,10 @@ crates above it in this table:
 |---|---|---|
 | [`bullpen-llm`](../crates/llm.md) | Provider-neutral conversation types, `Provider` trait, wire-format adapters, shared retry policy | Tools, transcripts, UI |
 | [`bullpen-auth`](../crates/auth.md) | Credential store, PKCE, OpenRouter OAuth, Codex device-code + refresh, read-only borrow of `~/.codex/auth.json` | Tools, the loop, UI |
-| [`bullpen-tools`](../crates/tools.md) | `Tool` trait, `Registry`, built-ins, parallel-safety flags | Providers, the loop |
-| [`bullpen-store`](../crates/store.md) | SQLite persistence: sessions, transcripts, usage; schema migrations via `user_version` | Providers, tools, the loop |
+| [`bullpen-tools`](../crates/tools.md) | `Tool` trait, `Registry`, built-ins (bash, hashline read/write/edit, grep, glob, ask, ast_grep/ast_edit, github), parallel-safety flags | Providers, the loop |
+| [`bullpen-store`](../crates/store.md) | SQLite persistence: sessions, transcripts, usage, todos; schema migrations via `user_version`; `pid_alive` | Providers, tools, the loop |
 | [`bullpen-agent`](../crates/agent.md) | The loop: transcript, provider calls, tool continuation, events, max-turns fuse, the `Journal` durability protocol (trait only) | Config files, sessions, vendors, UI, storage |
-| [`bullpen-harness`](../crates/harness.md) | Durable execution: `StoreJournal`, crash recovery orchestration, the pen | Vendors, UI |
+| [`bullpen-harness`](../crates/harness.md) | Durable execution: `StoreJournal`, crash recovery orchestration, the pen, `job`, `todo`, worktree placement | Vendors, UI |
 | `bullpen` ([cli](../crates/cli.md)) | Composition root: wiring, system prompt, headless `run`, `sessions` | — (the only crate that knows everything) |
 
 `bullpen-sandbox` ([sandbox](../crates/sandbox.md)) is a leaf dependency of
@@ -54,46 +54,45 @@ through the `Journal` to `StoreJournal`, which writes intent records before
 effects and result entries after. See [durable execution](durable-execution.md)
 for the protocol and [the agent loop](../crates/agent.md) for the loop body.
 
-<!-- openwiki: mermaid parse failed and this diagram was converted to a text fence so it does not break rendering. Fix the diagram source and restore the mermaid fence. Parser error: Heuristic: an unescaped angle bracket inside a label breaks rendering; rephrase the label. -->
-```text
+```mermaid
 sequenceDiagram
-    participant CLI as bullpen (cli)
+    participant CLI as bullpen cli
     participant SW as SessionWorker
-    participant H as harness::prepare_session
+    participant H as harness prepare_session
     participant SJ as StoreJournal
-    participant A as Agent (bullpen-agent)
-    participant P as Provider (bullpen-llm)
-    participant T as Tool (bullpen-tools)
-    participant S as Store (bullpen-store)
+    participant A as Agent bullpen-agent
+    participant P as Provider bullpen-llm
+    participant T as Tool bullpen-tools
+    participant S as Store bullpen-store
 
-    CLI->>SW: acquire(run/<id>.lock) + start(generation)
-    CLI->>H: prepare_session(store, id)
-    H->>S: recover() — reduce records, synth interrupted results
-    H->>S: path_messages(id) — rebuild transcript
-    H-->>CLI: (messages, recovery)
-    CLI->>A: Agent::new(...).with_journal(SJ).with_transcript(...)
-    CLI->>A: send(prompt)
-    A->>SJ: run_started(user)
+    CLI->>SW: acquire run lock + start generation
+    CLI->>H: prepare_session store id
+    H->>S: recover reduce records synth interrupted results
+    H->>S: path_messages id rebuild transcript
+    H-->>CLI: messages recovery
+    CLI->>A: Agent new with journal and transcript
+    CLI->>A: send prompt
+    A->>SJ: run_started user
     SJ->>S: start_operation + append user entry
     loop until end_turn or fuse
-        A->>SJ: step_attempt(n)
+        A->>SJ: step_attempt n
         SJ->>S: append step_attempt record
-        A->>P: complete_streaming(req, delta_sink)
-        P-->>A: Response (content, stop_reason, usage)
-        A->>SJ: assistant_message(msg)
+        A->>P: complete_streaming req delta_sink
+        P-->>A: Response content stop_reason usage
+        A->>SJ: assistant_message msg
         SJ->>S: append assistant entry
         opt tool_use blocks present
-            A->>SJ: tool_batch(intents)
-            SJ->>S: append tool_started records (shared results_entry_id)
-            A->>T: execute_batch (parallel-safe under semaphore)
-            T-->>A: outputs (request order)
-            A->>SJ: tool_results(grouped)
+            A->>SJ: tool_batch intents
+            SJ->>S: append tool_started records shared results_entry_id
+            A->>T: execute_batch parallel-safe under semaphore
+            T-->>A: outputs request order
+            A->>SJ: tool_results grouped
             SJ->>S: append grouped results entry at provisioned id
         end
     end
-    A->>SJ: run_finished(outcome, usage)
-    SJ->>S: finish_operation + roll up title/usage
-    CLI->>SW: finish("completed"|"failed") — stale-safe on generation
+    A->>SJ: run_finished outcome usage
+    SJ->>S: finish_operation + roll up title usage
+    CLI->>SW: finish completed or failed stale-safe on generation
 ```
 
 ## Where to go next
@@ -102,6 +101,9 @@ sequenceDiagram
 - For the conversation wire types and providers: [llm](../crates/llm.md) and
   the per-adapter pages it links.
 - For crash recovery specifically: [recovery](../crates/recovery.md).
-- For the pen (durable subagents): [pen](../crates/pen.md).
+- For the pen (durable subagents, worktree isolation, background dispatch):
+  [pen](../crates/pen.md).
+- For the job coordination tool: [job](../crates/job.md).
+- For the durable session plan: [todo](../crates/todo.md).
 - For the CLI that wires it all together: [cli](../crates/cli.md).
 - For first-time orientation and task routing: [quickstart](../quickstart.md).

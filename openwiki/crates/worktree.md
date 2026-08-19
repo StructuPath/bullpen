@@ -1,19 +1,24 @@
 ---
 type: crate
-title: bullpen CLI worktree — per-session git worktrees that are never removed
-description: The fail-closed worktree module — path/branch derivation, the resume decision table, the thin git adapter, git_write_roots widening the sandbox, and the four Location outcomes.
-tags: [cli, worktree, git, fail-closed, retention, sandbox-widening]
+title: worktree — per-session git worktrees that are never removed
+description: The fail-closed worktree module in bullpen-harness — path/branch derivation (including store-anchored paths for pen children), the resume decision table, the thin git adapter, git_write_roots widening the sandbox, and the four Location outcomes.
+tags: [worktree, git, fail-closed, retention, sandbox-widening, harness]
 ---
 
-# Per-session git worktrees (`crates/cli/src/worktree.rs`)
+# Per-session git worktrees (`crates/harness/src/worktree.rs`)
 
 `--bg --worktree` gives a background session its own git worktree on a
 run-unique `bullpen/<id>` branch, so concurrent background sessions stop
-editing each other's files. This module creates worktrees and **never removes
+editing each other's files. The [pen](pen.md) uses the same module to isolate a
+`worktree: true` work child. This module creates worktrees and **never removes
 one** — not on success, not on failure, not later. A worktree can hold the
 only copy of what an agent did, so cleaning up is yours to decide. The
 asymmetry is the whole argument: a leftover directory costs disk; an eager
 cleanup can destroy the only copy of the work.
+
+The module moved from `crates/cli` to `crates/harness` so the pen can place
+work children; the [CLI](cli.md) now imports it as `bullpen_harness::worktree`.
+The derivation and the `Location` decision table are unchanged.
 
 ## Pure derivation (testable without a repository)
 
@@ -21,6 +26,11 @@ cleanup can destroy the only copy of the work.
   `bullpen_store::home_dir`, not inside the repo — the worktree is bullpen's
   state, keyed to a session id; moving the database without it would split
   the two apart).
+- `worktree_path_for_store(store_path, session_id)` → the same layout anchored
+  to a specific store: `<store_dir>/worktrees/<id>`. For the default store
+  this is exactly `worktree_path`; for a pen pointed at an isolated store
+  (tests, `$BULLPEN_HOME`), the worktrees follow the store instead of the
+  ambient environment. The pen uses this in `place_child`.
 - `branch_for(session_id)` → `bullpen/<id>` (the whole id, not the short
   prefix the CLI prints — a truncated id is 32 bits and two collisions would
   name one branch, which git refuses to check out in two worktrees at once).
@@ -113,5 +123,6 @@ resuming onto a detached head would leave the work unreachable by that name
 `a_sandboxed_worktree_can_still_commit` is covered in [sandbox](sandbox.md).
 
 See [the CLI run path](cli.md) for where the worktree is recorded before
-creation and where `locate` decides the run directory, and [sandbox](sandbox.md)
-for how `git_write_roots` widens the write roots.
+creation and where `locate` decides the run directory, [the pen](pen.md) for
+how `place_child` records then creates a work child's worktree, and
+[sandbox](sandbox.md) for how `git_write_roots` widens the write roots.
