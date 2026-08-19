@@ -8,11 +8,14 @@
 //!
 //! This crate is the future home of the pen (durable subagents).
 
+pub mod job;
 pub mod pen;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod todo;
+pub mod worktree;
 
+pub use job::JobTool;
 pub use pen::{PenConfig, PenTool};
 pub use todo::TodoTool;
 

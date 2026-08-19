@@ -17,17 +17,7 @@ fn logs_dir() -> PathBuf {
     bullpen_store::home_dir().join("logs")
 }
 
-/// Whether `pid` is a live process. Uses `kill(pid, 0)`: success or an
-/// `EPERM` both mean the process exists.
-pub fn pid_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: kill with signal 0 performs only the existence/permission
-    // check and never delivers a signal.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
+pub use bullpen_store::status::pid_alive;
 
 /// Spawn a detached `bullpen run --resume <session_id> <prompt>` that outlives
 /// this process and the controlling terminal. Returns the child's pid.

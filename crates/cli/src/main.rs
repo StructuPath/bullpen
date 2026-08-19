@@ -7,7 +7,8 @@
 mod agents;
 mod bg;
 mod json;
-mod worktree;
+
+use bullpen_harness::worktree;
 
 use std::sync::Arc;
 
@@ -587,11 +588,11 @@ async fn run(
         pen_config = pen_config.with_sandbox(sb.clone());
     }
     let mut registry = Registry::standard();
-    registry.register(std::sync::Arc::new(bullpen_harness::PenTool::new(
-        provider.clone(),
-        &session.id,
-        pen_config,
-    )));
+    let pen = bullpen_harness::PenTool::new(provider.clone(), &session.id, pen_config);
+    // The job tool shares the pen's cancel registry, so background children
+    // dispatched by this process can be cancelled from the same session.
+    registry.register(std::sync::Arc::new(pen.job_tool()));
+    registry.register(std::sync::Arc::new(pen));
     // The plan: a durable todo list scoped to this session, in the store.
     registry.register(std::sync::Arc::new(bullpen_harness::TodoTool::new(
         Store::default_path(),

@@ -18,30 +18,24 @@ what bullpen ships today, and in what order the rest should land.
 | `write_file` / `edit_file` | write / edit | Sandbox write-confinement applies. |
 | `grep` | content search | Regex over the tree, `.gitignore`-aware. |
 | `glob` | path find | Pattern lookup; reach for `grep` when you need content. |
-| `agent` | task fan-out | The pen: durable child sessions, deterministic ids, reattach-on-replay, durable child budget. Inspect children run in parallel. |
+| `agent` | task fan-out | The pen: durable child sessions, deterministic ids, reattach-on-replay, durable child budget. `worktree: true` isolates a work child in its own git worktree on its own branch; `background: true` dispatches and returns immediately. Inspect, isolated, and background children all run in parallel. |
+| `job` | background coordination | The coordination plane, exposed to the model: `list` children with store-derived state (status + pid liveness), `wait` polls to a terminal state and returns the child's answer, `cancel` signals a background child — which finishes as failed and stays resumable. |
 | `todo` | session plan | Durable todo list in the store; replay-safe via deterministic item ids; the store enforces one item in progress at a time. |
 
 Two catalog entries cost nothing because they already exist under other
 names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
 `agent` tool.
 
-## Next: coordination (the durable-multi-agent story)
+## Next: coordination, completed
 
-These extend machinery bullpen already has, and they are the tools that
-make the thesis visible.
-
-- **`job`** — wait on or cancel background work. `bullpen run --bg` already
-  detaches sessions coordinated through the store; `job` exposes that plane
-  *to the model*: list a session's background children, block on one
-  finishing, cancel one. The store is the source of truth (status + pid
-  liveness), so a `job` call after a crash sees reality, not a stale
-  in-process handle.
-- **pen worktree isolation** — `agent` gains the CLI's `--worktree`
-  behavior: a work-mode child in its own git worktree on a `bullpen/<id>`
-  branch, making work children parallel-safe too.
 - **`ask`** — structured follow-up questions for interactive runs. Needs an
   interactivity channel in the CLI run loop; in non-interactive runs the
   tool reports that no one is listening rather than blocking forever.
+- **cross-process `job`** — today `cancel` reaches only background
+  children dispatched by the calling process (in-process cooperative
+  cancellation, so the child records its own terminal state). Signalling a
+  child owned by another process is a later, deliberate step: it needs a
+  protocol for the *other* process to finish its session cleanly.
 
 ## Then: files & search, deepened
 

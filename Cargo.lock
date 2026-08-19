@@ -193,6 +193,7 @@ dependencies = [
 name = "bullpen-harness"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bullpen-agent",
  "bullpen-llm",
@@ -233,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "bullpen-llm",
  "fs2",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

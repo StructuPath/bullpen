@@ -324,6 +324,19 @@ impl Store {
         self.get_session(child_id)
     }
 
+    /// A session's pen children, oldest first.
+    pub fn list_children(&self, parent_id: &str) -> Result<Vec<Session>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, cwd, provider, model, input_tokens, output_tokens,
+                    created_at, updated_at, parent_session_id, status, pid,
+                    worktree_path, worktree_branch
+             FROM sessions WHERE parent_session_id = ?1 ORDER BY created_at, id",
+        )?;
+        Ok(stmt
+            .query_map(params![parent_id], row_to_session)?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// How many children a session has spawned — the durable count budget.
     pub fn count_children(&self, parent_id: &str) -> Result<u64, StoreError> {
         Ok(self.conn.query_row(
