@@ -4,6 +4,7 @@
 //! application, never by the agent loop. The runtime — not the model — owns
 //! the parallel-safety decision via [`Tool::parallel_safe`].
 
+mod archive;
 mod ask;
 mod ast;
 mod bash;

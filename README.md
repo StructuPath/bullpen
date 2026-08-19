@@ -130,7 +130,7 @@ crash-recoverable and inspectable from the CLI the whole way.
 | Tool | What it does |
 |---|---|
 | `bash` | Shell in the workspace; sandboxed with its children under Seatbelt on macOS |
-| `read_file` | One path for files (hashline `line#hash` anchors), directories (sorted listings), SQLite databases (schema view or read-only `query`), and http(s) URLs (streamed cap; refused when the sandbox denies network) |
+| `read_file` | One path for files (hashline `line#hash` anchors), directories (sorted listings), SQLite databases (schema view or read-only `query`), zip/tar/tar.gz archives (listing or one `entry`; plain gzip decompresses as text), and http(s) URLs (streamed cap; refused when the sandbox denies network) |
 | `write_file` / `edit_file` | Writes under sandbox confinement; edits by exact string or by anchored hashline patch with stale-anchor recovery |
 | `grep` / `glob` | Regex content search and path patterns, `.gitignore`-aware |
 | `ast_grep` / `ast_edit` | Structural search and rewrite over the syntax tree via [ast-grep](https://ast-grep.github.io) (when installed); rewrites preview by default and write only on `apply: true` |

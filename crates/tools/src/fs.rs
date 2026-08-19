@@ -36,6 +36,31 @@ fn hashlines(lines: &[&str], first: usize, limit: usize) -> String {
         .collect()
 }
 
+/// What the content probes made of a path, decided in blocking work.
+enum Probed {
+    Sqlite,
+    Archive(crate::archive::Kind),
+    Plain,
+}
+
+/// Decompressed or extracted bytes rendered as hashline text, with the
+/// clip note when a bound cut them short.
+fn entry_text(bytes: &[u8], clipped: bool, empty: &str) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = hashlines(&lines, 1, usize::MAX);
+    if out.is_empty() {
+        out = empty.to_string();
+    }
+    if clipped {
+        out.push_str(&format!(
+            "[content clipped at {} bytes]\n",
+            crate::archive::MAX_ENTRY_BYTES
+        ));
+    }
+    truncate_middle(out, MAX_READ_BYTES)
+}
+
 pub struct ReadFile;
 
 #[async_trait::async_trait]
@@ -48,24 +73,27 @@ impl Tool for ReadFile {
         ToolSpec {
             name: "read_file".into(),
             description: "Read through one path: a file, a directory, a SQLite \
-                          database, or an http(s) URL. Files render as 1-indexed \
-                          `line#hash<TAB>content`, capped at 256 KiB — the \
-                          `line#hash` token is an anchor that `edit_file` \
-                          patches accept — with an optional line window. \
-                          Directories render a sorted listing. A SQLite file \
-                          (detected by content) renders its schema and row \
+                          database, an archive, or an http(s) URL. Files render \
+                          as 1-indexed `line#hash<TAB>content`, capped at 256 \
+                          KiB — the `line#hash` token is an anchor that \
+                          `edit_file` patches accept — with an optional line \
+                          window. Directories render a sorted listing. A SQLite \
+                          file (detected by content) renders its schema and row \
                           counts, or runs a read-only `query` (writes are \
-                          rejected by the engine). URLs are fetched with GET \
+                          rejected by the engine). A zip/tar/tar.gz archive \
+                          lists its entries, or renders one via `entry`; plain \
+                          gzip decompresses as text. URLs are fetched with GET \
                           (capped, 30s timeout); a sandbox that denies network \
                           refuses them."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File, directory, or SQLite path, or an http(s):// URL"},
+                    "path": {"type": "string", "description": "File, directory, SQLite, or archive path, or an http(s):// URL"},
                     "offset": {"type": "integer", "description": "1-indexed first line (files only)"},
                     "limit": {"type": "integer", "description": "Max lines to return (files only)"},
-                    "query": {"type": "string", "description": "Read-only SQL to run (SQLite files only)"}
+                    "query": {"type": "string", "description": "Read-only SQL to run (SQLite files only)"},
+                    "entry": {"type": "string", "description": "Archive member to read (archives only)"}
                 },
                 "required": ["path"]
             }),
@@ -89,17 +117,60 @@ impl Tool for ReadFile {
         if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
             return list_dir(&path).await;
         }
-        if crate::sqlite::is_sqlite(&path) {
-            let query = input
-                .get("query")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let db = path.clone();
-            return tokio::task::spawn_blocking(move || {
-                crate::sqlite::read_sqlite(&db, query.as_deref())
-            })
-            .await
-            .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
+        // Content probes read file heads synchronously — off the async
+        // worker, like every other blocking touch of the file.
+        let (path, probed) = tokio::task::spawn_blocking(move || {
+            let probed = if crate::sqlite::is_sqlite(&path) {
+                Probed::Sqlite
+            } else if let Some(kind) = crate::archive::detect(&path) {
+                Probed::Archive(kind)
+            } else {
+                Probed::Plain
+            };
+            (path, probed)
+        })
+        .await
+        .map_err(|e| ToolError::Failed(format!("probe task failed: {e}")))?;
+
+        match probed {
+            Probed::Plain => {}
+            Probed::Sqlite => {
+                let query = input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return tokio::task::spawn_blocking(move || {
+                    crate::sqlite::read_sqlite(&path, query.as_deref())
+                })
+                .await
+                .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
+            }
+            Probed::Archive(kind) => {
+                let entry = input
+                    .get("entry")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return tokio::task::spawn_blocking(move || {
+                    use crate::archive::Kind;
+                    match (kind, entry) {
+                        (Kind::Gz, None) => {
+                            let (bytes, clipped) = crate::archive::read_gz(&path)?;
+                            Ok(entry_text(&bytes, clipped, "(empty gzip stream)"))
+                        }
+                        (_, None) => crate::archive::list(&path, kind),
+                        (kind, Some(entry)) => {
+                            let (bytes, clipped) = crate::archive::read_entry(&path, kind, &entry)?;
+                            Ok(entry_text(
+                                &bytes,
+                                clipped,
+                                &format!("(empty entry {entry})"),
+                            ))
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| ToolError::Failed(format!("archive task failed: {e}")))?;
+            }
         }
         let raw = tokio::fs::read(&path)
             .await
@@ -866,6 +937,71 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("W12x26"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn plain_gzip_reads_as_decompressed_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(dir.path().join("notes.gz")).unwrap(),
+            flate2::Compression::default(),
+        );
+        std::io::Write::write_all(&mut gz, b"hello\nworld\n").unwrap();
+        gz.finish().unwrap();
+
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "notes.gz"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "1#{}\thello\n2#{}\tworld\n",
+                line_hash("hello"),
+                line_hash("world")
+            )
+        );
+
+        let err = ReadFile
+            .run(&c, "t", json!({"path": "notes.gz", "entry": "x"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_archive_reads_as_a_listing_then_an_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        let mut writer =
+            zip::ZipWriter::new(std::fs::File::create(dir.path().join("bundle.zip")).unwrap());
+        writer
+            .start_file("src/lib.rs", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"pub fn one() {}\n").unwrap();
+        writer.finish().unwrap();
+
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "bundle.zip"}))
+            .await
+            .unwrap();
+        assert!(out.contains("zip archive"), "{out}");
+        assert!(out.contains("src/lib.rs  16 bytes"), "{out}");
+
+        let out = ReadFile
+            .run(
+                &c,
+                "t",
+                json!({"path": "bundle.zip", "entry": "src/lib.rs"}),
+            )
+            .await
+            .unwrap();
+        // The entry renders as ordinary hashline text.
+        assert_eq!(
+            out,
+            format!("1#{}\tpub fn one() {{}}\n", line_hash("pub fn one() {}"))
+        );
     }
 
     /// One canned HTTP exchange on a local port; returns the URL to hit.
