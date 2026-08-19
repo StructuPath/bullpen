@@ -10,6 +10,7 @@ mod bash;
 mod fs;
 mod github;
 mod search;
+mod sqlite;
 
 pub use ask::{Ask, Asker};
 pub use ast::{AstEdit, AstGrep};

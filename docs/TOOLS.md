@@ -14,7 +14,7 @@ what bullpen ships today, and in what order the rest should land.
 | Tool | Catalog role | Notes |
 |---|---|---|
 | `bash` | runtime shell | Serial, sandboxable (Seatbelt on macOS), timeout-bounded. |
-| `read_file` | read | One path for files, directories, and http(s) URLs. Files are hashline output — every line carries a `line#hash` anchor — capped head+tail; directories render sorted listings; URLs fetch with a streamed cap and honor the sandbox's network policy. |
+| `read_file` | read | One path for files, directories, SQLite databases, and http(s) URLs. Files are hashline output — every line carries a `line#hash` anchor — capped head+tail; directories render sorted listings; SQLite files (detected by magic, not extension) render schema + row counts or run a read-only `query` (writes rejected by the engine via `mode=ro` + `query_only`, with an `immutable=1` fallback for live-WAL stores); URLs fetch with a streamed cap and honor the sandbox's network policy. |
 | `write_file` / `edit_file` | write / edit | Sandbox write-confinement applies. `edit_file` takes exact-string replacements or hashline patches — hunks addressed by anchors, spans via `to`, with stale-anchor recovery: a moved line is followed while its content hash is unique, a changed line fails with fresh context instead of misapplying. |
 | `grep` | content search | Regex over the tree, `.gitignore`-aware. |
 | `glob` | path find | Pattern lookup; reach for `grep` when you need content. |
@@ -39,7 +39,7 @@ names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
 
 ## Then: files & search, deepened
 
-- **richer `read`** — directories and URLs are in; archives, SQLite, and
+- **richer `read`** — directories, URLs, and SQLite are in; archives and
   PDFs remain, each an incremental, independently testable decoder behind
   the existing tool.
 

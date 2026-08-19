@@ -256,6 +256,7 @@ dependencies = [
  "ignore",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
