@@ -17,6 +17,7 @@ bullpen-llm.workspace = true
 bullpen-store.workspace = true
 bullpen-tools.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

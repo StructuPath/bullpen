@@ -138,6 +138,7 @@ name = "bullpen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bullpen-agent",
  "bullpen-auth",
  "bullpen-harness",

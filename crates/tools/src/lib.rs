@@ -4,10 +4,12 @@
 //! application, never by the agent loop. The runtime — not the model — owns
 //! the parallel-safety decision via [`Tool::parallel_safe`].
 
+mod ask;
 mod bash;
 mod fs;
 mod search;
 
+pub use ask::{Ask, Asker};
 pub use bash::Bash;
 pub use fs::{EditFile, ReadFile, WriteFile};
 pub use search::{Glob, Grep};

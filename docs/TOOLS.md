@@ -21,16 +21,14 @@ what bullpen ships today, and in what order the rest should land.
 | `agent` | task fan-out | The pen: durable child sessions, deterministic ids, reattach-on-replay, durable child budget. `worktree: true` isolates a work child in its own git worktree on its own branch; `background: true` dispatches and returns immediately. Inspect, isolated, and background children all run in parallel. |
 | `job` | background coordination | The coordination plane, exposed to the model: `list` children with store-derived state (status + pid liveness), `wait` polls to a terminal state and returns the child's answer, `cancel` signals a background child — which finishes as failed and stays resumable. |
 | `todo` | session plan | Durable todo list in the store; replay-safe via deterministic item ids; the store enforces one item in progress at a time. |
+| `ask` | follow-up questions | Transport-agnostic: interactive runs answer from the terminal, detached runs (background, `--json`, piped) fail the call with the reason instead of blocking forever. Numbered options resolve to their text. |
 
 Two catalog entries cost nothing because they already exist under other
 names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
 `agent` tool.
 
-## Next: coordination, completed
+## Coordination leftovers
 
-- **`ask`** — structured follow-up questions for interactive runs. Needs an
-  interactivity channel in the CLI run loop; in non-interactive runs the
-  tool reports that no one is listening rather than blocking forever.
 - **cross-process `job`** — today `cancel` reaches only background
   children dispatched by the calling process (in-process cooperative
   cancellation, so the child records its own terminal state). Signalling a
