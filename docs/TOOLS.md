@@ -14,7 +14,7 @@ what bullpen ships today, and in what order the rest should land.
 | Tool | Catalog role | Notes |
 |---|---|---|
 | `bash` | runtime shell | Serial, sandboxable (Seatbelt on macOS), timeout-bounded. |
-| `read_file` | read | Workspace-relative, output capped head+tail. Hashline output: every line carries a `line#hash` anchor. |
+| `read_file` | read | One path for files, directories, and http(s) URLs. Files are hashline output — every line carries a `line#hash` anchor — capped head+tail; directories render sorted listings; URLs fetch with a streamed cap and honor the sandbox's network policy. |
 | `write_file` / `edit_file` | write / edit | Sandbox write-confinement applies. `edit_file` takes exact-string replacements or hashline patches — hunks addressed by anchors, spans via `to`, with stale-anchor recovery: a moved line is followed while its content hash is unique, a changed line fails with fresh context instead of misapplying. |
 | `grep` | content search | Regex over the tree, `.gitignore`-aware. |
 | `glob` | path find | Pattern lookup; reach for `grep` when you need content. |
@@ -41,9 +41,9 @@ names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
   by shelling out to [ast-grep]. Preview-then-apply maps onto intent
   records: the preview is durable, the apply is a separate confirmed step
   (the catalog's `resolve`).
-- **richer `read`** — one path for directories, archives, SQLite, PDFs,
-  and URLs. Each format is an incremental, independently testable decoder
-  behind the existing tool.
+- **richer `read`** — directories and URLs are in; archives, SQLite, and
+  PDFs remain, each an incremental, independently testable decoder behind
+  the existing tool.
 
 ## Then: reaching outside the workspace
 
@@ -51,8 +51,9 @@ Each of these wraps a proven external surface; the work is inputs,
 sandbox policy, and output discipline, not invention.
 
 - **`github`** — `gh` CLI operations (repo, PR, issues, run-watch).
-- **`web_search` / `fetch`** — provider-backed search plus page retrieval.
-  `--sandbox-strict` (network cut) must disable them cleanly.
+- **`web_search`** — provider-backed search (page retrieval already ships
+  as URL reads). `--sandbox-strict` (network cut) must disable it cleanly,
+  as it already does for URL reads.
 - **`ssh`** — one remote command against a configured host; never
   implicit, always named host allowlists.
 

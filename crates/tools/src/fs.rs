@@ -47,17 +47,21 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a file, optionally a line window. Output is 1-indexed \
-                          `line#hash<TAB>content` and capped at 256 KiB; the \
-                          `line#hash` token is an anchor that `edit_file` patches \
-                          accept."
+            description: "Read through one path: a file, a directory, or an \
+                          http(s) URL. Files render as 1-indexed \
+                          `line#hash<TAB>content`, capped at 256 KiB — the \
+                          `line#hash` token is an anchor that `edit_file` \
+                          patches accept — with an optional line window. \
+                          Directories render a sorted listing. URLs are \
+                          fetched with GET (capped, 30s timeout); a sandbox \
+                          that denies network refuses them."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "description": "1-indexed first line"},
-                    "limit": {"type": "integer", "description": "Max lines to return"}
+                    "path": {"type": "string", "description": "File or directory path, or an http(s):// URL"},
+                    "offset": {"type": "integer", "description": "1-indexed first line (files only)"},
+                    "limit": {"type": "integer", "description": "Max lines to return (files only)"}
                 },
                 "required": ["path"]
             }),
@@ -73,7 +77,14 @@ impl Tool for ReadFile {
     }
 
     async fn run(&self, ctx: &ToolCtx, _call_id: &str, input: Value) -> Result<String, ToolError> {
-        let path = resolve_path(ctx, required_str(&input, "path")?);
+        let raw_path = required_str(&input, "path")?;
+        if raw_path.starts_with("http://") || raw_path.starts_with("https://") {
+            return read_url(ctx, raw_path).await;
+        }
+        let path = resolve_path(ctx, raw_path);
+        if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
+            return list_dir(&path).await;
+        }
         let raw = tokio::fs::read(&path)
             .await
             .map_err(|e| ToolError::Failed(format!("cannot read {}: {e}", path.display())))?;
@@ -100,6 +111,96 @@ impl Tool for ReadFile {
         }
         Ok(truncate_middle(numbered, MAX_READ_BYTES))
     }
+}
+
+/// How much of a URL body is kept. Bounded while streaming, not after: a
+/// response has no business filling memory just to be truncated.
+const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
+
+/// GET a URL. The sandbox's network capability governs this exactly as it
+/// governs shell commands: `--sandbox-strict` cuts it.
+async fn read_url(ctx: &ToolCtx, url: &str) -> Result<String, ToolError> {
+    if let Some(sandbox) = &ctx.sandbox
+        && !sandbox.capabilities().allow_network
+    {
+        return Err(ToolError::Failed(
+            "sandbox: network access is disabled, so URLs cannot be fetched".into(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ToolError::Failed(format!("http client: {e}")))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(format!("GET {url}: {e}")))?;
+    let status = response.status();
+
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    let mut clipped = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ToolError::Failed(format!("GET {url}: {e}")))?;
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_FETCH_BYTES {
+            body.truncate(MAX_FETCH_BYTES);
+            clipped = true;
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&body);
+    if !status.is_success() {
+        return Err(ToolError::Failed(format!(
+            "GET {url} returned {status}\n{}",
+            truncate_middle(text.into_owned(), 2_000)
+        )));
+    }
+    Ok(truncate_middle(
+        format!(
+            "GET {url} → {status}{}\n\n{text}",
+            if clipped { " (body clipped)" } else { "" }
+        ),
+        MAX_READ_BYTES,
+    ))
+}
+
+/// A directory as a sorted listing: directories first, sizes for files.
+async fn list_dir(path: &std::path::Path) -> Result<String, ToolError> {
+    let mut reader = tokio::fs::read_dir(path)
+        .await
+        .map_err(|e| ToolError::Failed(format!("cannot read {}: {e}", path.display())))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .map_err(|e| ToolError::Failed(format!("cannot read {}: {e}", path.display())))?
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let meta = entry.metadata().await;
+        let is_dir = meta.as_ref().is_ok_and(|m| m.is_dir());
+        let size = meta.map(|m| m.len()).unwrap_or(0);
+        entries.push((!is_dir, name, size));
+    }
+    if entries.is_empty() {
+        return Ok(format!("(empty directory {})", path.display()));
+    }
+    entries.sort();
+    let mut out = format!(
+        "directory {} ({} entries):\n",
+        path.display(),
+        entries.len()
+    );
+    for (is_file, name, size) in entries {
+        if is_file {
+            out.push_str(&format!("  {name}  {size} bytes\n"));
+        } else {
+            out.push_str(&format!("  {name}/\n"));
+        }
+    }
+    Ok(truncate_middle(out, MAX_READ_BYTES))
 }
 
 pub struct WriteFile;
@@ -697,6 +798,84 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("x = 2"));
+    }
+
+    #[tokio::test]
+    async fn a_directory_reads_as_a_sorted_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        tokio::fs::create_dir(dir.path().join("sub")).await.unwrap();
+        tokio::fs::write(dir.path().join("b.txt"), "12345")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), "1")
+            .await
+            .unwrap();
+
+        let out = ReadFile.run(&c, "t", json!({"path": "."})).await.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("directory"), "{out}");
+        assert!(lines[0].contains("3 entries"), "{out}");
+        // Directories first, then files alphabetically, with sizes.
+        assert_eq!(
+            &lines[1..],
+            ["  sub/", "  a.txt  1 bytes", "  b.txt  5 bytes"]
+        );
+    }
+
+    /// One canned HTTP exchange on a local port; returns the URL to hit.
+    fn serve_once(response: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn urls_fetch_through_the_same_path() {
+        let url =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+        let dir = tempfile::tempdir().unwrap();
+        let out = ReadFile
+            .run(&ctx(&dir), "t", json!({"path": url}))
+            .await
+            .unwrap();
+        assert!(out.contains("200"), "{out}");
+        assert!(out.contains("hello"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_url_is_an_error_carrying_the_status() {
+        let url = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = ReadFile
+            .run(&ctx(&dir), "t", json!({"path": url}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("404"), "{msg}");
+        assert!(msg.contains("gone"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_network_denying_sandbox_refuses_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = std::sync::Arc::new(bullpen_sandbox::Sandbox::strict(dir.path()));
+        let c = ToolCtx::new(dir.path()).with_sandbox(sandbox);
+        let err = ReadFile
+            .run(&c, "t", json!({"path": "http://127.0.0.1:1/never"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("network"), "{err}");
     }
 
     #[tokio::test]
