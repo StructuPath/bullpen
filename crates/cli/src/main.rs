@@ -7,7 +7,8 @@
 mod agents;
 mod bg;
 mod json;
-mod worktree;
+
+use bullpen_harness::worktree;
 
 use std::sync::Arc;
 
@@ -587,11 +588,24 @@ async fn run(
         pen_config = pen_config.with_sandbox(sb.clone());
     }
     let mut registry = Registry::standard();
-    registry.register(std::sync::Arc::new(bullpen_harness::PenTool::new(
-        provider.clone(),
+    let pen = bullpen_harness::PenTool::new(provider.clone(), &session.id, pen_config);
+    // The job tool shares the pen's cancel registry, so background children
+    // dispatched by this process can be cancelled from the same session.
+    registry.register(std::sync::Arc::new(pen.job_tool()));
+    registry.register(std::sync::Arc::new(pen));
+    // The plan: a durable todo list scoped to this session, in the store.
+    registry.register(std::sync::Arc::new(bullpen_harness::TodoTool::new(
+        Store::default_path(),
         &session.id,
-        pen_config,
     )));
+    // Follow-up questions reach the terminal only when someone is on it;
+    // otherwise the detached variant answers with the reason instead.
+    let interactive = !json && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    registry.register(std::sync::Arc::new(if interactive {
+        bullpen_tools::Ask::interactive(Arc::new(TtyAsker))
+    } else {
+        bullpen_tools::Ask::detached()
+    }));
     let mut agent = Agent::new(provider, registry, tool_ctx, config)
         .with_transcript(transcript, usage)
         .with_events(tx)
@@ -742,6 +756,37 @@ fn sessions(json: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The CLI's [`bullpen_tools::Asker`]: the question goes to stderr — never
+/// into the answer stream on stdout — and the reply is one line from the
+/// terminal. Reading blocks a spawned blocking thread, not the runtime.
+struct TtyAsker;
+
+#[async_trait::async_trait]
+impl bullpen_tools::Asker for TtyAsker {
+    async fn ask(&self, prompt: &str) -> Result<String, bullpen_tools::ToolError> {
+        let prompt = prompt.to_string();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let mut err = std::io::stderr();
+            let _ = writeln!(err, "\n[bullpen asks]\n{prompt}");
+            let _ = write!(err, "> ");
+            let _ = err.flush();
+            let mut line = String::new();
+            match std::io::stdin().lock().read_line(&mut line) {
+                Ok(0) => Err(bullpen_tools::ToolError::Failed(
+                    "input closed before an answer".into(),
+                )),
+                Ok(_) => Ok(line),
+                Err(e) => Err(bullpen_tools::ToolError::Failed(format!(
+                    "could not read the answer: {e}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| bullpen_tools::ToolError::Failed(format!("ask task failed: {e}")))?
+    }
 }
 
 fn system_prompt(cwd: &std::path::Path) -> String {

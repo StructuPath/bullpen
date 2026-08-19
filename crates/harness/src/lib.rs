@@ -6,13 +6,20 @@
 //! idempotent. [`prepare_session`] is the front door: recover if a previous
 //! process died mid-run, then hand back the rebuilt transcript.
 //!
-//! This crate is the future home of the pen (durable subagents).
+//! This crate also hosts the session-scoped tools that need the store:
+//! the pen (durable subagents), `job` (the coordination plane), `todo`
+//! (the durable session plan), and worktree placement.
 
+pub mod job;
 pub mod pen;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod todo;
+pub mod worktree;
 
+pub use job::JobTool;
 pub use pen::{PenConfig, PenTool};
+pub use todo::TodoTool;
 
 use bullpen_agent::{Journal, JournalError, RunOutcome, ToolIntent};
 use bullpen_llm::{Message, Usage};

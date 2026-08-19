@@ -138,6 +138,7 @@ name = "bullpen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bullpen-agent",
  "bullpen-auth",
  "bullpen-harness",
@@ -193,6 +194,7 @@ dependencies = [
 name = "bullpen-harness"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bullpen-agent",
  "bullpen-llm",
@@ -233,6 +235,7 @@ version = "0.1.0"
 dependencies = [
  "bullpen-llm",
  "fs2",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -248,11 +251,14 @@ dependencies = [
  "async-trait",
  "bullpen-llm",
  "bullpen-sandbox",
+ "futures",
  "globset",
  "ignore",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

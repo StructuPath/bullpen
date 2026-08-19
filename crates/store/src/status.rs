@@ -42,6 +42,18 @@ impl AgentStatus {
     }
 }
 
+/// Whether `pid` is a live process. Uses `kill(pid, 0)`: success or an
+/// `EPERM` both mean the process exists.
+pub fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 performs only the existence/permission
+    // check and never delivers a signal.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Derive the display state. `alive` is whether the session's recorded pid is
 /// a live process (the caller checks the OS); it only matters while the
 /// stored status is `running`.

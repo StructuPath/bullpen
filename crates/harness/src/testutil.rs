@@ -30,6 +30,20 @@ impl Provider for FakeProvider {
     }
 }
 
+/// A provider whose call never resolves — for cancellation and liveness
+/// tests.
+pub struct HangingProvider;
+
+#[async_trait::async_trait]
+impl Provider for HangingProvider {
+    fn name(&self) -> &str {
+        "hang"
+    }
+    async fn complete(&self, _: &Request) -> Result<Response, ProviderError> {
+        std::future::pending().await
+    }
+}
+
 pub fn response(blocks: Vec<ContentBlock>, stop: StopReason) -> Response {
     Response {
         content: blocks,

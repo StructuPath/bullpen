@@ -29,6 +29,14 @@ pub fn worktree_path(session_id: &str) -> PathBuf {
     worktree_dir(&bullpen_store::home_dir(), session_id)
 }
 
+/// The same layout, anchored to a specific store: worktrees live alongside
+/// the database. For the default store this is exactly [`worktree_path`];
+/// for a pen pointed at an isolated store (tests, `$BULLPEN_HOME`), the
+/// worktrees follow the store instead of the ambient environment.
+pub fn worktree_path_for_store(store_path: &Path, session_id: &str) -> PathBuf {
+    worktree_dir(store_path.parent().unwrap_or(Path::new(".")), session_id)
+}
+
 fn worktree_dir(home: &Path, session_id: &str) -> PathBuf {
     home.join("worktrees").join(session_id)
 }

@@ -106,10 +106,13 @@ so cleaning up is yours to decide.
 ## The pen
 
 The model can delegate bounded work to child agents through the `agent`
-tool: `inspect` for read-only reconnaissance, `work` for the full toolset.
-Children are ordinary sessions — durable, budgeted, listed by
-`bullpen sessions`, resumable — with deterministic identities, so a replayed
-delegation reattaches to its child instead of running it twice.
+tool: `inspect` for read-only reconnaissance, `work` for the full toolset —
+optionally in the child's own git worktree (`worktree: true`), optionally
+detached (`background: true`) with the `job` tool to list, wait on, and
+cancel what's in flight. Children are ordinary sessions — durable,
+budgeted, listed by `bullpen sessions`, resumable — with deterministic
+identities, so a replayed delegation reattaches to its child instead of
+running it twice.
 
 ## Providers
 
@@ -125,7 +128,9 @@ Adapters are organized by wire format rather than vendor, which is why
 compatible hosts are configuration instead of code.
 
 Built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `grep`,
-`glob` — plus `agent` when the pen is enabled.
+`glob`, `todo` (a durable session plan), `ask` (follow-up questions on
+interactive runs) — plus `agent` and `job` when the pen is enabled.
+[docs/TOOLS.md](docs/TOOLS.md) maps the rest of the planned surface.
 
 ## Where state lives
 
@@ -151,7 +156,7 @@ directly in it, with no `.bullpen` segment appended.
 
 | | |
 |---|---|
-| ✅ Shipped | Durable execution + crash recovery · the pen (durable subagents) · write-confinement sandbox with Seatbelt on macOS · agent view (dispatch, peek, live state) · 5 providers |
+| ✅ Shipped | Durable execution + crash recovery · the pen (durable subagents, worktree isolation, background dispatch + `job`) · hashline edits with anchor recovery · durable session plans (`todo`) · follow-up questions (`ask`) · write-confinement sandbox with Seatbelt on macOS · agent view (dispatch, peek, live state) · 5 providers |
 | 🚧 Next | Interactive attach to a live session · needs-input state · notifications · compaction |
 | 📋 Planned | Landlock confinement on Linux · a durable workflow engine (steps in SQLite, resumable from any step) |
 
