@@ -36,6 +36,31 @@ fn hashlines(lines: &[&str], first: usize, limit: usize) -> String {
         .collect()
 }
 
+/// What the content probes made of a path, decided in blocking work.
+enum Probed {
+    Sqlite,
+    Archive(crate::archive::Kind),
+    Plain,
+}
+
+/// Decompressed or extracted bytes rendered as hashline text, with the
+/// clip note when a bound cut them short.
+fn entry_text(bytes: &[u8], clipped: bool, empty: &str) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = hashlines(&lines, 1, usize::MAX);
+    if out.is_empty() {
+        out = empty.to_string();
+    }
+    if clipped {
+        out.push_str(&format!(
+            "[content clipped at {} bytes]\n",
+            crate::archive::MAX_ENTRY_BYTES
+        ));
+    }
+    truncate_middle(out, MAX_READ_BYTES)
+}
+
 pub struct ReadFile;
 
 #[async_trait::async_trait]
@@ -56,9 +81,10 @@ impl Tool for ReadFile {
                           file (detected by content) renders its schema and row \
                           counts, or runs a read-only `query` (writes are \
                           rejected by the engine). A zip/tar/tar.gz archive \
-                          lists its entries, or renders one via `entry`. URLs \
-                          are fetched with GET (capped, 30s timeout); a sandbox \
-                          that denies network refuses them."
+                          lists its entries, or renders one via `entry`; plain \
+                          gzip decompresses as text. URLs are fetched with GET \
+                          (capped, 30s timeout); a sandbox that denies network \
+                          refuses them."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -91,43 +117,60 @@ impl Tool for ReadFile {
         if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
             return list_dir(&path).await;
         }
-        if crate::sqlite::is_sqlite(&path) {
-            let query = input
-                .get("query")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            return tokio::task::spawn_blocking(move || {
-                crate::sqlite::read_sqlite(&path, query.as_deref())
-            })
-            .await
-            .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
-        }
-        if let Some(kind) = crate::archive::detect(&path) {
-            let entry = input
-                .get("entry")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            return tokio::task::spawn_blocking(move || match entry {
-                None => crate::archive::list(&path, kind),
-                Some(entry) => {
-                    let (bytes, clipped) = crate::archive::read_entry(&path, kind, &entry)?;
-                    let text = String::from_utf8_lossy(&bytes);
-                    let lines: Vec<&str> = text.lines().collect();
-                    let mut out = hashlines(&lines, 1, usize::MAX);
-                    if out.is_empty() {
-                        out = format!("(empty entry {entry})");
+        // Content probes read file heads synchronously — off the async
+        // worker, like every other blocking touch of the file.
+        let (path, probed) = tokio::task::spawn_blocking(move || {
+            let probed = if crate::sqlite::is_sqlite(&path) {
+                Probed::Sqlite
+            } else if let Some(kind) = crate::archive::detect(&path) {
+                Probed::Archive(kind)
+            } else {
+                Probed::Plain
+            };
+            (path, probed)
+        })
+        .await
+        .map_err(|e| ToolError::Failed(format!("probe task failed: {e}")))?;
+
+        match probed {
+            Probed::Plain => {}
+            Probed::Sqlite => {
+                let query = input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return tokio::task::spawn_blocking(move || {
+                    crate::sqlite::read_sqlite(&path, query.as_deref())
+                })
+                .await
+                .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
+            }
+            Probed::Archive(kind) => {
+                let entry = input
+                    .get("entry")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return tokio::task::spawn_blocking(move || {
+                    use crate::archive::Kind;
+                    match (kind, entry) {
+                        (Kind::Gz, None) => {
+                            let (bytes, clipped) = crate::archive::read_gz(&path)?;
+                            Ok(entry_text(&bytes, clipped, "(empty gzip stream)"))
+                        }
+                        (_, None) => crate::archive::list(&path, kind),
+                        (kind, Some(entry)) => {
+                            let (bytes, clipped) = crate::archive::read_entry(&path, kind, &entry)?;
+                            Ok(entry_text(
+                                &bytes,
+                                clipped,
+                                &format!("(empty entry {entry})"),
+                            ))
+                        }
                     }
-                    if clipped {
-                        out.push_str(&format!(
-                            "[entry clipped at {} bytes]\n",
-                            crate::archive::MAX_ENTRY_BYTES
-                        ));
-                    }
-                    Ok(truncate_middle(out, MAX_READ_BYTES))
-                }
-            })
-            .await
-            .map_err(|e| ToolError::Failed(format!("archive task failed: {e}")))?;
+                })
+                .await
+                .map_err(|e| ToolError::Failed(format!("archive task failed: {e}")))?;
+            }
         }
         let raw = tokio::fs::read(&path)
             .await
@@ -894,6 +937,37 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("W12x26"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn plain_gzip_reads_as_decompressed_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(dir.path().join("notes.gz")).unwrap(),
+            flate2::Compression::default(),
+        );
+        std::io::Write::write_all(&mut gz, b"hello\nworld\n").unwrap();
+        gz.finish().unwrap();
+
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "notes.gz"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "1#{}\thello\n2#{}\tworld\n",
+                line_hash("hello"),
+                line_hash("world")
+            )
+        );
+
+        let err = ReadFile
+            .run(&c, "t", json!({"path": "notes.gz", "entry": "x"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "{err}");
     }
 
     #[tokio::test]

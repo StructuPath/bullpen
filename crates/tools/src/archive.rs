@@ -11,22 +11,36 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::ToolError;
+use crate::{ToolError, truncate_middle};
 
 /// Listing cap; the true total is always reported.
 const MAX_ENTRIES: usize = 1_000;
 /// Extraction cap, enforced while streaming (zip bombs stay in the bottle).
 pub(crate) const MAX_ENTRY_BYTES: usize = 262_144; // matches file reads
+/// Rendered-listing cap, matching the other read views.
+const MAX_OUTPUT_BYTES: usize = 100_000;
+/// How much of a tar stream a scan may consume, measured after
+/// decompression. Listing or searching a tar walks the whole stream, and
+/// without this a small gzip bomb buys unbounded CPU; hitting the bound
+/// caps the listing (reported) or fails the entry search (explained).
+const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+/// Distinctive marker carried by the cap's io error, so the tar iterator's
+/// wrapped failure is recognizable as "capped", not "corrupt".
+const SCAN_CAP: &str = "bullpen-archive-scan-cap";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Zip,
     Tar,
     TarGz,
+    /// A gzip stream that is not a tar — plain compressed content, read as
+    /// text rather than rejected as a malformed archive.
+    Gz,
 }
 
 /// Recognize an archive by content: zip's `PK` local/empty headers, gzip's
-/// two magic bytes, or tar's `ustar` at offset 257.
+/// two magic bytes, or tar's `ustar` at offset 257. A gzip stream is only
+/// a tar.gz if the *decompressed* head carries the tar magic too.
 pub(crate) fn detect(path: &Path) -> Option<Kind> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 265];
@@ -36,12 +50,54 @@ pub(crate) fn detect(path: &Path) -> Option<Kind> {
         return Some(Kind::Zip);
     }
     if head.starts_with(&[0x1f, 0x8b]) {
-        return Some(Kind::TarGz);
+        let file = std::fs::File::open(path).ok()?;
+        let mut inner = [0u8; 262];
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut got = 0;
+        while got < inner.len() {
+            match decoder.read(&mut inner[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        return Some(if got >= 262 && &inner[257..262] == b"ustar" {
+            Kind::TarGz
+        } else {
+            Kind::Gz
+        });
     }
     if n >= 262 && &head[257..262] == b"ustar" {
         return Some(Kind::Tar);
     }
     None
+}
+
+/// A reader that refuses to hand out more than `remaining` bytes; the
+/// refusal is an io error carrying [`SCAN_CAP`].
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other(SCAN_CAP));
+        }
+        let want = buf
+            .len()
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Whether a tar iteration error is the scan cap biting (as opposed to a
+/// genuinely corrupt archive).
+fn is_scan_cap(e: &std::io::Error) -> bool {
+    e.to_string().contains(SCAN_CAP)
 }
 
 fn arch_err(path: &Path, e: impl std::fmt::Display) -> ToolError {
@@ -57,19 +113,22 @@ struct Entry {
 
 /// `total` counts every member scanned; `entries` holds at most
 /// [`MAX_ENTRIES`] of them — the cap is applied while scanning, so a
-/// million-member archive costs a count, not a vector.
-fn render(path: &Path, kind: Kind, entries: Vec<Entry>, total: usize) -> String {
+/// million-member archive costs a count, not a vector. `capped` means the
+/// scan budget ran out first: the total is a floor, not a count.
+fn render(path: &Path, kind: Kind, entries: Vec<Entry>, total: usize, capped: bool) -> String {
     let label = match kind {
         Kind::Zip => "zip",
         Kind::Tar => "tar",
         Kind::TarGz => "tar.gz",
+        Kind::Gz => "gzip",
     };
-    if entries.is_empty() {
+    if entries.is_empty() && !capped {
         return format!("(empty {label} archive {})", path.display());
     }
     let mut out = format!(
-        "{label} archive {} ({total} entries) — pass `entry` to read one:\n",
-        path.display()
+        "{label} archive {} ({total}{} entries) — pass `entry` to read one:\n",
+        path.display(),
+        if capped { "+" } else { "" }
     );
     for entry in &entries {
         if entry.is_dir {
@@ -78,10 +137,15 @@ fn render(path: &Path, kind: Kind, entries: Vec<Entry>, total: usize) -> String 
             out.push_str(&format!("  {}  {} bytes\n", entry.name, entry.size));
         }
     }
-    if total > entries.len() {
+    if capped {
+        out.push_str(&format!(
+            "[scan capped at {} MiB — listing incomplete]\n",
+            MAX_SCAN_BYTES / (1024 * 1024)
+        ));
+    } else if total > entries.len() {
         out.push_str(&format!("[listed the first {MAX_ENTRIES}]\n"));
     }
-    out
+    truncate_middle(out, MAX_OUTPUT_BYTES)
 }
 
 /// Read `reader` into a bounded buffer; `true` when the cap cut it short.
@@ -102,17 +166,31 @@ fn zip_archive(path: &Path) -> Result<zip::ZipArchive<std::fs::File>, ToolError>
 
 fn tar_archive(path: &Path, kind: Kind) -> Result<tar::Archive<Box<dyn Read>>, ToolError> {
     let file = std::fs::File::open(path).map_err(|e| arch_err(path, e))?;
-    let reader: Box<dyn Read> = match kind {
+    let raw: Box<dyn Read> = match kind {
         Kind::TarGz => Box::new(flate2::read::GzDecoder::new(file)),
         _ => Box::new(file),
     };
-    Ok(tar::Archive::new(reader))
+    // The whole scan — headers plus the payloads the iterator skips over —
+    // draws from one decompressed-byte budget, so a small gzip bomb stops
+    // at the budget instead of costing unbounded CPU.
+    Ok(tar::Archive::new(Box::new(LimitedReader {
+        inner: raw,
+        remaining: MAX_SCAN_BYTES,
+    })))
 }
 
 /// The listing view.
 pub(crate) fn list(path: &Path, kind: Kind) -> Result<String, ToolError> {
-    let (entries, total) = match kind {
+    let (entries, total, capped) = match kind {
+        Kind::Gz => {
+            return Err(ToolError::InvalidInput(format!(
+                "{} is a plain gzip stream, not an archive — read it without \
+                 `entry` to see its decompressed content",
+                path.display()
+            )));
+        }
         Kind::Zip => {
+            // The central directory answers without touching member data.
             let mut archive = zip_archive(path)?;
             let total = archive.len();
             let mut entries = Vec::new();
@@ -124,14 +202,22 @@ pub(crate) fn list(path: &Path, kind: Kind) -> Result<String, ToolError> {
                     is_dir: member.is_dir(),
                 });
             }
-            (entries, total)
+            (entries, total, false)
         }
         Kind::Tar | Kind::TarGz => {
             let mut archive = tar_archive(path, kind)?;
             let mut entries = Vec::new();
             let mut total = 0;
+            let mut capped = false;
             for member in archive.entries().map_err(|e| arch_err(path, e))? {
-                let member = member.map_err(|e| arch_err(path, e))?;
+                let member = match member {
+                    Ok(member) => member,
+                    Err(e) if is_scan_cap(&e) => {
+                        capped = true;
+                        break;
+                    }
+                    Err(e) => return Err(arch_err(path, e)),
+                };
                 total += 1;
                 if entries.len() < MAX_ENTRIES {
                     entries.push(Entry {
@@ -145,10 +231,10 @@ pub(crate) fn list(path: &Path, kind: Kind) -> Result<String, ToolError> {
                     });
                 }
             }
-            (entries, total)
+            (entries, total, capped)
         }
     };
-    Ok(render(path, kind, entries, total))
+    Ok(render(path, kind, entries, total, capped))
 }
 
 /// Extract one member's bytes (bounded). The name must match a listed
@@ -172,6 +258,11 @@ pub(crate) fn read_entry(
         ))
     };
     match kind {
+        Kind::Gz => Err(ToolError::InvalidInput(format!(
+            "{} is a plain gzip stream, not an archive — read it without \
+             `entry` to see its decompressed content",
+            path.display()
+        ))),
         Kind::Zip => {
             let mut archive = zip_archive(path)?;
             let member = match archive.by_name(entry) {
@@ -182,9 +273,21 @@ pub(crate) fn read_entry(
             bounded_read(member).map_err(|e| arch_err(path, e))
         }
         Kind::Tar | Kind::TarGz => {
+            let scan_out = || {
+                ToolError::Failed(format!(
+                    "the {} MiB scan budget ran out before `{entry}` in {} — \
+                     extract oversized archives with bash instead",
+                    MAX_SCAN_BYTES / (1024 * 1024),
+                    path.display()
+                ))
+            };
             let mut archive = tar_archive(path, kind)?;
             for member in archive.entries().map_err(|e| arch_err(path, e))? {
-                let member = member.map_err(|e| arch_err(path, e))?;
+                let member = match member {
+                    Ok(member) => member,
+                    Err(e) if is_scan_cap(&e) => return Err(scan_out()),
+                    Err(e) => return Err(arch_err(path, e)),
+                };
                 if member
                     .path()
                     .map_err(|e| arch_err(path, e))?
@@ -192,12 +295,24 @@ pub(crate) fn read_entry(
                     .to_string()
                     == entry
                 {
-                    return bounded_read(member).map_err(|e| arch_err(path, e));
+                    return bounded_read(member).map_err(|e| {
+                        if is_scan_cap(&e) {
+                            scan_out()
+                        } else {
+                            arch_err(path, e)
+                        }
+                    });
                 }
             }
             Err(missing())
         }
     }
+}
+
+/// A plain gzip stream: its decompressed content, bounded like any entry.
+pub(crate) fn read_gz(path: &Path) -> Result<(Vec<u8>, bool), ToolError> {
+    let file = std::fs::File::open(path).map_err(|e| arch_err(path, e))?;
+    bounded_read(flate2::read::GzDecoder::new(file)).map_err(|e| arch_err(path, e))
 }
 
 #[cfg(test)]
@@ -309,13 +424,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("many.tar");
         let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        // Long names, so the rendered listing would blow past the output
+        // cap if it were unbounded.
+        let name = |i: usize| format!("{}{i:04}.txt", "n".repeat(150));
         for i in 0..(MAX_ENTRIES + 5) {
             let mut header = tar::Header::new_gnu();
             header.set_size(1);
             header.set_mode(0o644);
             header.set_cksum();
             builder
-                .append_data(&mut header, format!("f{i:04}.txt"), &b"x"[..])
+                .append_data(&mut header, name(i), &b"x"[..])
                 .unwrap();
         }
         builder.finish().unwrap();
@@ -329,7 +447,73 @@ mod tests {
             out.contains(&format!("[listed the first {MAX_ENTRIES}]")),
             "{out}"
         );
-        assert!(!out.contains("f1002.txt"), "{out}");
+        assert!(!out.contains(&name(MAX_ENTRIES + 2)), "{out}");
+        // The rendered output itself is bounded, not just the entry count.
+        assert!(out.len() <= MAX_OUTPUT_BYTES + 200, "{}", out.len());
+    }
+
+    #[test]
+    fn plain_gzip_text_is_gz_not_a_broken_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.gz");
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        gz.write_all(b"hello\nworld\n").unwrap();
+        gz.finish().unwrap();
+
+        assert_eq!(detect(&path), Some(Kind::Gz));
+        let (bytes, clipped) = read_gz(&path).unwrap();
+        assert_eq!(bytes, b"hello\nworld\n");
+        assert!(!clipped);
+        // The archive views refuse it with a pointer to the text path.
+        assert!(matches!(
+            list(&path, Kind::Gz),
+            Err(ToolError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            read_entry(&path, Kind::Gz, "x"),
+            Err(ToolError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn tar_scans_stop_at_the_decompressed_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.tgz");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        // First member decompresses past the scan budget; a marker hides
+        // behind it. Compressed, the whole thing stays tiny.
+        let big = MAX_SCAN_BYTES + 8 * 1024 * 1024;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(big);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "large.bin", std::io::repeat(0).take(big))
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "marker.txt", &b"x"[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let out = list(&path, Kind::TarGz).unwrap();
+        assert!(out.contains("1+ entries"), "{out}");
+        assert!(out.contains("large.bin"), "{out}");
+        assert!(out.contains("scan capped"), "{out}");
+        assert!(!out.contains("marker.txt"), "{out}");
+
+        let err = read_entry(&path, Kind::TarGz, "marker.txt").unwrap_err();
+        assert!(err.to_string().contains("scan budget"), "{err}");
     }
 
     #[test]
