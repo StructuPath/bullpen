@@ -48,24 +48,26 @@ impl Tool for ReadFile {
         ToolSpec {
             name: "read_file".into(),
             description: "Read through one path: a file, a directory, a SQLite \
-                          database, or an http(s) URL. Files render as 1-indexed \
-                          `line#hash<TAB>content`, capped at 256 KiB — the \
-                          `line#hash` token is an anchor that `edit_file` \
-                          patches accept — with an optional line window. \
-                          Directories render a sorted listing. A SQLite file \
-                          (detected by content) renders its schema and row \
+                          database, an archive, or an http(s) URL. Files render \
+                          as 1-indexed `line#hash<TAB>content`, capped at 256 \
+                          KiB — the `line#hash` token is an anchor that \
+                          `edit_file` patches accept — with an optional line \
+                          window. Directories render a sorted listing. A SQLite \
+                          file (detected by content) renders its schema and row \
                           counts, or runs a read-only `query` (writes are \
-                          rejected by the engine). URLs are fetched with GET \
-                          (capped, 30s timeout); a sandbox that denies network \
-                          refuses them."
+                          rejected by the engine). A zip/tar/tar.gz archive \
+                          lists its entries, or renders one via `entry`. URLs \
+                          are fetched with GET (capped, 30s timeout); a sandbox \
+                          that denies network refuses them."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File, directory, or SQLite path, or an http(s):// URL"},
+                    "path": {"type": "string", "description": "File, directory, SQLite, or archive path, or an http(s):// URL"},
                     "offset": {"type": "integer", "description": "1-indexed first line (files only)"},
                     "limit": {"type": "integer", "description": "Max lines to return (files only)"},
-                    "query": {"type": "string", "description": "Read-only SQL to run (SQLite files only)"}
+                    "query": {"type": "string", "description": "Read-only SQL to run (SQLite files only)"},
+                    "entry": {"type": "string", "description": "Archive member to read (archives only)"}
                 },
                 "required": ["path"]
             }),
@@ -100,6 +102,34 @@ impl Tool for ReadFile {
             })
             .await
             .map_err(|e| ToolError::Failed(format!("sqlite task failed: {e}")))?;
+        }
+        if let Some(kind) = crate::archive::detect(&path) {
+            let entry = input
+                .get("entry")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let archive = path.clone();
+            return tokio::task::spawn_blocking(move || match entry {
+                None => crate::archive::list(&archive, kind),
+                Some(entry) => {
+                    let (bytes, clipped) = crate::archive::read_entry(&archive, kind, &entry)?;
+                    let text = String::from_utf8_lossy(&bytes);
+                    let lines: Vec<&str> = text.lines().collect();
+                    let mut out = hashlines(&lines, 1, usize::MAX);
+                    if out.is_empty() {
+                        out = format!("(empty entry {entry})");
+                    }
+                    if clipped {
+                        out.push_str(&format!(
+                            "[entry clipped at {} bytes]\n",
+                            crate::archive::MAX_ENTRY_BYTES
+                        ));
+                    }
+                    Ok(truncate_middle(out, MAX_READ_BYTES))
+                }
+            })
+            .await
+            .map_err(|e| ToolError::Failed(format!("archive task failed: {e}")))?;
         }
         let raw = tokio::fs::read(&path)
             .await
@@ -866,6 +896,40 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("W12x26"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_archive_reads_as_a_listing_then_an_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(&dir);
+        let mut writer =
+            zip::ZipWriter::new(std::fs::File::create(dir.path().join("bundle.zip")).unwrap());
+        writer
+            .start_file("src/lib.rs", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"pub fn one() {}\n").unwrap();
+        writer.finish().unwrap();
+
+        let out = ReadFile
+            .run(&c, "t", json!({"path": "bundle.zip"}))
+            .await
+            .unwrap();
+        assert!(out.contains("zip archive"), "{out}");
+        assert!(out.contains("src/lib.rs  16 bytes"), "{out}");
+
+        let out = ReadFile
+            .run(
+                &c,
+                "t",
+                json!({"path": "bundle.zip", "entry": "src/lib.rs"}),
+            )
+            .await
+            .unwrap();
+        // The entry renders as ordinary hashline text.
+        assert_eq!(
+            out,
+            format!("1#{}\tpub fn one() {{}}\n", line_hash("pub fn one() {}"))
+        );
     }
 
     /// One canned HTTP exchange on a local port; returns the URL to hit.
