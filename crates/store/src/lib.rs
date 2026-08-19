@@ -103,6 +103,16 @@ pub struct OpenRun {
     pub records: Vec<Record>,
 }
 
+/// One item on a session's durable plan. `status` is `pending`,
+/// `in_progress`, or `completed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Todo {
+    pub id: String,
+    pub position: i64,
+    pub content: String,
+    pub status: String,
+}
+
 /// The directory holding bullpen's own state: `$BULLPEN_HOME` when set to a
 /// non-empty path, otherwise `~/.bullpen`.
 pub fn home_dir() -> PathBuf {
@@ -147,7 +157,7 @@ impl Store {
         let observed: i64 = self
             .conn
             .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))?;
-        if observed >= 7 {
+        if observed >= 8 {
             return Ok(());
         }
 
@@ -247,6 +257,21 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN worker_generation TEXT;
                  PRAGMA user_version = 7;",
+            )?;
+        }
+        if version < 8 {
+            tx.execute_batch(
+                "CREATE TABLE todos (
+                    id         TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    position   INTEGER NOT NULL,
+                    content    TEXT NOT NULL,
+                    status     TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE INDEX todos_by_session ON todos(session_id, position);
+                 PRAGMA user_version = 8;",
             )?;
         }
         tx.commit()?;
@@ -719,6 +744,121 @@ impl Store {
             ))),
         }
     }
+
+    // ── Todos (the session plan) ────────────────────────────────────────────
+
+    /// Append a todo with a caller-provisioned (deterministic) id at the end
+    /// of the session's plan. Idempotent: an id that already exists is left
+    /// untouched — this is what makes a replayed `add` safe.
+    pub fn add_todo(
+        &mut self,
+        session_id: &str,
+        id: &str,
+        content: &str,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM todos WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            // Aggregate subquery: one row even for an empty plan.
+            tx.execute(
+                "INSERT INTO todos (id, session_id, position, content)
+                 SELECT ?1, ?2, COALESCE(MAX(position), 0) + 1, ?3
+                 FROM todos WHERE session_id = ?2",
+                params![id, session_id, content],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move a todo (resolved by id prefix) to `status`. Marking one
+    /// `in_progress` returns every other in-progress todo to `pending`:
+    /// the store owns the one-active-item invariant, not the model.
+    pub fn set_todo_status(
+        &mut self,
+        session_id: &str,
+        prefix: &str,
+        status: &str,
+    ) -> Result<Todo, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let todo = resolve_todo(&tx, session_id, prefix)?;
+        if status == "in_progress" {
+            tx.execute(
+                "UPDATE todos SET status = 'pending', updated_at = datetime('now')
+                 WHERE session_id = ?1 AND status = 'in_progress' AND id != ?2",
+                params![session_id, todo.id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE todos SET status = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![todo.id, status],
+        )?;
+        tx.commit()?;
+        Ok(Todo {
+            status: status.to_string(),
+            ..todo
+        })
+    }
+
+    /// Delete a todo, resolved by id prefix.
+    pub fn remove_todo(&mut self, session_id: &str, prefix: &str) -> Result<Todo, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let todo = resolve_todo(&tx, session_id, prefix)?;
+        tx.execute("DELETE FROM todos WHERE id = ?1", params![todo.id])?;
+        tx.commit()?;
+        Ok(todo)
+    }
+
+    /// The session's plan in order.
+    pub fn list_todos(&self, session_id: &str) -> Result<Vec<Todo>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, position, content, status FROM todos
+             WHERE session_id = ?1 ORDER BY position",
+        )?;
+        Ok(stmt
+            .query_map(params![session_id], row_to_todo)?
+            .collect::<Result<_, _>>()?)
+    }
+}
+
+/// Resolve a todo by id prefix within one session, mirroring session prefix
+/// resolution: zero matches is `NotFound`, two or more is `Ambiguous`.
+fn resolve_todo(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    prefix: &str,
+) -> Result<Todo, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT id, position, content, status FROM todos
+         WHERE session_id = ?1 AND id LIKE ?2 || '%' LIMIT 2",
+    )?;
+    let mut matches: Vec<Todo> = stmt
+        .query_map(params![session_id, prefix], row_to_todo)?
+        .collect::<Result<_, _>>()?;
+    match matches.len() {
+        0 => Err(StoreError::NotFound(prefix.to_string())),
+        1 => Ok(matches.remove(0)),
+        _ => Err(StoreError::Ambiguous(prefix.to_string())),
+    }
+}
+
+fn row_to_todo(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {
+    Ok(Todo {
+        id: row.get(0)?,
+        position: row.get(1)?,
+        content: row.get(2)?,
+        status: row.get(3)?,
+    })
 }
 
 /// Allocate the next per-session sequence number inside the caller's
@@ -1112,7 +1252,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1139,6 +1279,111 @@ mod tests {
         let failed = store.get_session(&session.id).unwrap();
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.pid, None);
+    }
+
+    #[test]
+    fn todos_append_in_order_and_adds_are_idempotent() {
+        let (_dir, mut store) = store();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+
+        store.add_todo(&s.id, "t1", "first").unwrap();
+        store.add_todo(&s.id, "t2", "second").unwrap();
+        // Replayed add: same id, no duplicate, positions untouched.
+        store.add_todo(&s.id, "t1", "first").unwrap();
+
+        let todos = store.list_todos(&s.id).unwrap();
+        assert_eq!(
+            todos
+                .iter()
+                .map(|t| (t.position, t.content.as_str(), t.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "first", "pending"), (2, "second", "pending")]
+        );
+    }
+
+    #[test]
+    fn only_one_todo_is_ever_in_progress() {
+        let (_dir, mut store) = store();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+        store.add_todo(&s.id, "t1", "first").unwrap();
+        store.add_todo(&s.id, "t2", "second").unwrap();
+
+        store.set_todo_status(&s.id, "t1", "in_progress").unwrap();
+        store.set_todo_status(&s.id, "t2", "in_progress").unwrap();
+
+        let statuses: Vec<String> = store
+            .list_todos(&s.id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.status)
+            .collect();
+        assert_eq!(statuses, vec!["pending", "in_progress"]);
+    }
+
+    #[test]
+    fn todo_prefix_resolution_mirrors_sessions() {
+        let (_dir, mut store) = store();
+        let s = store.create_session("/tmp", "anthropic", "m").unwrap();
+        store.add_todo(&s.id, "abc-1", "one").unwrap();
+        store.add_todo(&s.id, "abd-2", "two").unwrap();
+
+        assert!(matches!(
+            store.set_todo_status(&s.id, "ab", "completed"),
+            Err(StoreError::Ambiguous(_))
+        ));
+        assert!(matches!(
+            store.remove_todo(&s.id, "zzz"),
+            Err(StoreError::NotFound(_))
+        ));
+
+        let done = store.set_todo_status(&s.id, "abc", "completed").unwrap();
+        assert_eq!(done.status, "completed");
+        let removed = store.remove_todo(&s.id, "abd").unwrap();
+        assert_eq!(removed.content, "two");
+        assert_eq!(store.list_todos(&s.id).unwrap().len(), 1);
+
+        // Another session's todos are invisible to this one's prefixes.
+        let other = store.create_session("/tmp", "anthropic", "m").unwrap();
+        assert!(matches!(
+            store.set_todo_status(&other.id, "abc", "completed"),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn migrates_v7_sessions_adding_todos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v7.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL, model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    provider TEXT NOT NULL DEFAULT 'anthropic',
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    parent_session_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    pid INTEGER,
+                    worktree_path TEXT,
+                    worktree_branch TEXT,
+                    worker_generation TEXT
+                 );
+                 INSERT INTO sessions (id, cwd, model) VALUES ('s1', '/tmp', 'm');
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&path).unwrap();
+        // Sessions that predate the feature simply have an empty plan.
+        assert_eq!(store.list_todos("s1").unwrap(), vec![]);
+        store.add_todo("s1", "t1", "works").unwrap();
+        assert_eq!(store.list_todos("s1").unwrap().len(), 1);
     }
 
     #[test]

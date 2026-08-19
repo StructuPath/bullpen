@@ -1,0 +1,103 @@
+# Tools: what exists, what's next
+
+bullpen grows its tool surface the same way it grows everything else:
+durability first. A tool earns its place when it can honor the contract in
+`crates/tools` — the runtime owns parallel-safety and replay-safety, effects
+are idempotent on the provider-assigned `call_id`, and a crash mid-call
+leaves state the next process can recover.
+
+This document maps a best-in-class agent tool surface onto that contract:
+what bullpen ships today, and in what order the rest should land.
+
+## Shipped
+
+| Tool | Catalog role | Notes |
+|---|---|---|
+| `bash` | runtime shell | Serial, sandboxable (Seatbelt on macOS), timeout-bounded. |
+| `read_file` | read | Workspace-relative, output capped head+tail. |
+| `write_file` / `edit_file` | write / edit | Sandbox write-confinement applies. |
+| `grep` | content search | Regex over the tree, `.gitignore`-aware. |
+| `glob` | path find | Pattern lookup; reach for `grep` when you need content. |
+| `agent` | task fan-out | The pen: durable child sessions, deterministic ids, reattach-on-replay, durable child budget. Inspect children run in parallel. |
+| `todo` | session plan | Durable todo list in the store; replay-safe via deterministic item ids; the store enforces one item in progress at a time. |
+
+Two catalog entries cost nothing because they already exist under other
+names: `find` is `glob`, `search` is `grep`, and `task` is the pen's
+`agent` tool.
+
+## Next: coordination (the durable-multi-agent story)
+
+These extend machinery bullpen already has, and they are the tools that
+make the thesis visible.
+
+- **`job`** — wait on or cancel background work. `bullpen run --bg` already
+  detaches sessions coordinated through the store; `job` exposes that plane
+  *to the model*: list a session's background children, block on one
+  finishing, cancel one. The store is the source of truth (status + pid
+  liveness), so a `job` call after a crash sees reality, not a stale
+  in-process handle.
+- **pen worktree isolation** — `agent` gains the CLI's `--worktree`
+  behavior: a work-mode child in its own git worktree on a `bullpen/<id>`
+  branch, making work children parallel-safe too.
+- **`ask`** — structured follow-up questions for interactive runs. Needs an
+  interactivity channel in the CLI run loop; in non-interactive runs the
+  tool reports that no one is listening rather than blocking forever.
+
+## Then: files & search, deepened
+
+- **hashline `edit`** — content-hash anchors with stale-anchor recovery,
+  replacing brittle exact-string matching. Pairs naturally with the
+  durability model: an anchor is an intent that can be revalidated on
+  replay.
+- **`ast_grep` / `ast_edit`** — structural queries and previewed rewrites
+  by shelling out to [ast-grep]. Preview-then-apply maps onto intent
+  records: the preview is durable, the apply is a separate confirmed step
+  (the catalog's `resolve`).
+- **richer `read`** — one path for directories, archives, SQLite, PDFs,
+  and URLs. Each format is an incremental, independently testable decoder
+  behind the existing tool.
+
+## Then: reaching outside the workspace
+
+Each of these wraps a proven external surface; the work is inputs,
+sandbox policy, and output discipline, not invention.
+
+- **`github`** — `gh` CLI operations (repo, PR, issues, run-watch).
+- **`web_search` / `fetch`** — provider-backed search plus page retrieval.
+  `--sandbox-strict` (network cut) must disable them cleanly.
+- **`ssh`** — one remote command against a configured host; never
+  implicit, always named host allowlists.
+
+## Later: each a project of its own
+
+Worth doing only when the layers above are solid, and each behind its own
+design doc:
+
+- **`lsp` / `debug`** — language-server navigation and DAP sessions.
+  Long-lived server processes need ownership like `SessionWorker` gives
+  runs: exclusive, generation-stamped, crash-detectable.
+- **`eval`** — persistent Python/JavaScript cells. Kernel state is
+  process state — exactly what bullpen promises survives — so cells must
+  journal their inputs to be replayable into a fresh kernel.
+- **`browser`** — CDP-driven tabs; the largest sandbox-policy surface.
+- **memory & context** — `checkpoint` / `rewind` (transcript compaction is
+  already an anticipated entry kind in the store's tree design) and a
+  `retain` / `recall` memory bank.
+- **media** — image inspection and generation, diagram rendering, TTS.
+
+## The bar for a new tool
+
+Before a tool merges it must answer, in code:
+
+1. **What does a crash mid-call leave behind?** If the answer is "state
+   the next process cannot interpret", it is not done.
+2. **Is `replay_safe` honest?** Only `true` when re-execution with the
+   same input and `call_id` converges — deterministic derived ids are the
+   house pattern (the pen's child sessions, `todo`'s item ids).
+3. **Is `parallel_safe` decided by the runtime?** Per-invocation, from the
+   input, never from model self-declaration.
+4. **Does the sandbox still mean something?** Write confinement and
+   `--sandbox-strict` network cuts apply to the new capability or the tool
+   explains, loudly, why not.
+
+[ast-grep]: https://ast-grep.github.io

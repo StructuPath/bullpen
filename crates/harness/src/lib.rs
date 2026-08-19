@@ -11,8 +11,10 @@
 pub mod pen;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod todo;
 
 pub use pen::{PenConfig, PenTool};
+pub use todo::TodoTool;
 
 use bullpen_agent::{Journal, JournalError, RunOutcome, ToolIntent};
 use bullpen_llm::{Message, Usage};

@@ -592,6 +592,11 @@ async fn run(
         &session.id,
         pen_config,
     )));
+    // The plan: a durable todo list scoped to this session, in the store.
+    registry.register(std::sync::Arc::new(bullpen_harness::TodoTool::new(
+        Store::default_path(),
+        &session.id,
+    )));
     let mut agent = Agent::new(provider, registry, tool_ctx, config)
         .with_transcript(transcript, usage)
         .with_events(tx)
