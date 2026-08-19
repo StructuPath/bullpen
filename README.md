@@ -35,7 +35,14 @@ nothing was ever supervising it.
 
 **The sandbox is a feature, not a footnote.** `--sandbox` confines writes to
 the workspace on every platform and, on macOS, runs shell commands *and their
-children* under Seatbelt. `--sandbox-strict` also cuts network.
+children* under Seatbelt. `--sandbox-strict` also cuts network — including
+URL fetches through the read tool.
+
+**Edits can't land in the wrong place.** File reads are hashline: every
+line carries a content-hash anchor, and patches address those anchors. An
+edit against a file that drifted is detected — a moved line is followed
+while its hash is unique, a changed line fails with fresh context — never
+silently misapplied.
 
 ## Install
 
@@ -114,6 +121,29 @@ budgeted, listed by `bullpen sessions`, resumable — with deterministic
 identities, so a replayed delegation reattaches to its child instead of
 running it twice.
 
+Put together: the model can fan out several isolated work children in the
+background, keep working, then join on each result — and every child stays
+crash-recoverable and inspectable from the CLI the whole way.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `bash` | Shell in the workspace; sandboxed with its children under Seatbelt on macOS |
+| `read_file` | One path for files (hashline `line#hash` anchors), directories (sorted listings), and http(s) URLs (streamed cap; refused when the sandbox denies network) |
+| `write_file` / `edit_file` | Writes under sandbox confinement; edits by exact string or by anchored hashline patch with stale-anchor recovery |
+| `grep` / `glob` | Regex content search and path patterns, `.gitignore`-aware |
+| `agent` | The pen: delegate to durable child agents (above) |
+| `job` | The coordination plane: list children with live state, wait for a result, cancel a background child |
+| `todo` | A durable session plan in the store — survives crashes and resumes; one item in progress at a time, enforced by the runtime |
+| `ask` | One structured question to whoever is driving an interactive run; detached runs get the reason instead of a hang |
+
+Parallel safety is decided per call by the runtime, never self-declared by
+the model: reads, inspect children, isolated work children, and background
+dispatches run concurrently; shared-checkout mutations stay serial.
+[docs/TOOLS.md](docs/TOOLS.md) maps the rest of the planned surface onto
+the durability contract.
+
 ## Providers
 
 | Provider | Wire format | Auth | Verified |
@@ -126,11 +156,6 @@ running it twice.
 
 Adapters are organized by wire format rather than vendor, which is why
 compatible hosts are configuration instead of code.
-
-Built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `grep`,
-`glob`, `todo` (a durable session plan), `ask` (follow-up questions on
-interactive runs) — plus `agent` and `job` when the pen is enabled.
-[docs/TOOLS.md](docs/TOOLS.md) maps the rest of the planned surface.
 
 ## Where state lives
 
