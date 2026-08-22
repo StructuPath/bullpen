@@ -29,8 +29,31 @@ profile.release uses `lto = "thin"` and `strip = true`.
 CI runs on push to `main` and on PRs, with `cancel-in-progress` per
 `workflow-ref`. Least-privilege `permissions: contents: read`.
 
-The OpenWiki update workflow (`.github/workflows/openwiki-update.yml`)
-regenerates this wiki on a schedule.
+### OpenWiki update workflow (`.github/workflows/openwiki-update.yml`)
+
+A separate workflow regenerates this wiki rather than validating product code.
+It is **not** one of the CI gates and runs independently.
+
+- **Triggers** — `workflow_dispatch` (manual) and `schedule: cron 0 8 * * *`
+  (daily 08:00 UTC). Not on push/PR, so it never blocks merges.
+- **Checkout** — `fetch-depth: 0`. Full history is required: `openwiki code
+  --update` diffs HEAD against the commit it last documented (stored in
+  `openwiki/.last-update.json`); a shallow clone hides that commit and makes
+  the update run against an empty change summary.
+- **Run** — installs `openwiki@0.3.3` (plus `mermaid@11.16.0`,
+  `jsdom@29.1.1` for Mermaid-diagram validation) globally, then runs
+  `openwiki code --update --print` with an OpenRouter model
+  (`OPENWIKI_PROVIDER=openrouter`, `OPENWIKI_MODEL_ID=z-ai/glm-5.2`).
+  Required repo secrets: `OPENROUTER_API_KEY` (and `OPENWIKI_LANGSMITH_API_KEY`
+  for the LangSmith connector pull; `LANGSMITH_API_KEY`/`LANGCHAIN_PROJECT`
+  only to optionally trace the run itself).
+- **Publishing** — `peter-evans/create-pull-request@v7` opens an
+  `openwiki/update` branch/PR scoped to `openwiki`, `AGENTS.md`, `CLAUDE.md`,
+  and the workflow file itself; a human merges the PR. `permissions:
+  contents: write, pull-requests: write`.
+
+To force a refresh off-schedule, run the workflow via the Actions UI
+(`workflow_dispatch`); otherwise wait for the daily cron.
 
 ## The standard tool registry (`Registry::standard`)
 
